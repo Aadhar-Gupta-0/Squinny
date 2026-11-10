@@ -1,0 +1,101 @@
+name: Import Squinny with accessibility checks
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bootstrap.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Import pinned source and test accessibility audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch main 'https://github.com/aayambansal/squint.git' "$RUNNER_TEMP/upstream"
+          test "$(git -C "$RUNNER_TEMP/upstream" rev-parse HEAD)" = "8426821344a8bb73edfe07dbd80cdedc818f9fcd"
+          rsync -a --exclude '.git' --exclude '.github' --exclude '.env' "$RUNNER_TEMP/upstream/" ./
+          python - <<'PY'
+          from pathlib import Path
+          tool=Path("tools/landing-audit.mjs");tool.parent.mkdir(exist_ok=True)
+          tool.write_text("""#!/usr/bin/env node
+          /** Read-only static landing-page audit. Complements (does not replace) axe/browser testing. */
+          import { readFileSync } from 'node:fs';
+          export function inspectHtml(html) {
+            const issues=[];
+            const images=[...html.matchAll(/<img\\b([^>]*)>/gi)];
+            for (const [_,attrs] of images) {
+              if (!/\\balt\\s*=/i.test(attrs)) issues.push({level:'warning',rule:'image-alt',message:'Image lacks alt attribute'});
+            }
+            const links=[...html.matchAll(/<a\\b([^>]*)>/gi)];
+            for (const [_,attrs] of links) {
+              if (/\\btarget\\s*=\\s*["']?_blank/i.test(attrs) &&
+                  !/\\brel\\s*=\\s*["'][^"']*\\bnoopener\\b/i.test(attrs)) {
+                issues.push({level:'warning',rule:'external-link',message:'External target link lacks rel=noopener'});
+              }
+            }
+            if (!/<html\\b[^>]*\\blang\\s*=/i.test(html))
+              issues.push({level:'warning',rule:'html-lang',message:'Document should declare its language'});
+            if (!/<meta\\b[^>]*name=["']viewport["']/i.test(html))
+              issues.push({level:'warning',rule:'viewport',message:'Missing mobile viewport meta tag'});
+            return {images:images.length,links:links.length,issues};
+          }
+          if (process.argv[1] && import.meta.url===new URL('file://'+process.argv[1]).href) {
+            const file=process.argv[2]||'landing/index.html';
+            const result=inspectHtml(readFileSync(file,'utf8'));
+            console.log(JSON.stringify(result,null,2));
+            process.exitCode=result.issues.length?1:0;
+          }
+          """)
+          Path("tools/landing-audit.test.mjs").write_text("""import test from 'node:test';
+          import assert from 'node:assert/strict';
+          import { inspectHtml } from './landing-audit.mjs';
+          test('finds missing alt',()=>{
+           const x=inspectHtml('<html lang="en"><meta name="viewport" content="width=device-width"><img src="x">');
+           assert(x.issues.some(y=>y.rule==='image-alt'));
+          });
+          test('finds unsafe new tab links',()=>{
+           assert(inspectHtml('<html lang="en"><meta name="viewport"><a target="_blank" href="x">x</a>').issues.some(x=>x.rule==='external-link'));
+          });
+          test('accepts basic safe markup',()=>{
+           assert.equal(inspectHtml('<html lang="en"><meta name="viewport"><img src="x" alt=""><a target="_blank" rel="noopener noreferrer">a</a>').issues.length,0);
+          });
+          """)
+          Path("docs/landing-audit.md").write_text("""# Landing-page accessibility baseline
+          
+          This edition includes a minimal, offline HTML inspector for \`landing/index.html\`. It scans for missing image \`alt\` attributes, external new-tab links without \`rel=noopener\`, missing language declarations and missing viewport metadata.
+          
+          \`\`\`bash
+          node tools/landing-audit.mjs landing/index.html
+          node --test tools/landing-audit.test.mjs
+          \`\`\`
+          
+          **Important:** This is static analysis, not a full accessibility certification. Test with keyboard-only navigation, screen readers, mobile viewport sizes and reduced-motion settings.
+          
+          The audit module and its regression tests are newly added in this independent edition. Original MIT copyright, package identity and upstream contributor notices are retained.
+          """)
+          p=Path("README.md");s=p.read_text()
+          s="""# Squinny — Frontend Agent Harness (Independent Edition)
+          
+          This separately maintained edition extends the original terminal-centric frontend quality harness with a **read-only landing-page accessibility audit** and regression tests. See [landing audit](docs/landing-audit.md).
+          
+          The original MIT license, copyright and upstream contribution history are retained.
+          
+          ---
+          
+          """+s
+          p.write_text(s)
+          
+          PY
+          node --test tools/landing-audit.test.mjs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Import Squint and add HTML accessibility audit tooling'
+          git push origin HEAD:main
