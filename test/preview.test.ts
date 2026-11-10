@@ -1,0 +1,96 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { findChrome, screenshot } from '../src/preview/chrome.js'
+import { buildReviewPrompt, previewDir, VIEWPORTS } from '../src/preview/preview.js'
+
+let dir: string
+
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'squint-preview-'))
+})
+
+afterEach(() => {
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+describe('previewDir', () => {
+  it('creates .squint/preview and keeps it out of git', () => {
+    const preview = previewDir(dir)
+    expect(fs.existsSync(preview)).toBe(true)
+    expect(fs.readFileSync(path.join(dir, '.squint', '.gitignore'), 'utf8')).toContain('preview/')
+  })
+})
+
+describe('buildReviewPrompt', () => {
+  it('lists shots and demands visible, ranked issues', () => {
+    const prompt = buildReviewPrompt([
+      { name: 'mobile', path: '/x/mobile.png' },
+      { name: 'desktop', path: '/x/desktop.png' },
+    ])
+    expect(prompt).toContain('/x/mobile.png')
+    expect(prompt).toContain('horizontal overflow')
+    expect(prompt).toContain('issues you can SEE')
+  })
+
+  it('threads a focus area through when given', () => {
+    expect(buildReviewPrompt([{ name: 'desktop', path: '/x/d.png' }], 'the pricing table')).toContain(
+      'the pricing table',
+    )
+  })
+})
+
+describe('viewports', () => {
+  it('covers the standard review trio', () => {
+    expect(VIEWPORTS.map((v) => v.name)).toEqual(['mobile', 'tablet', 'desktop'])
+  })
+})
+
+describe('routes', () => {
+  it('always includes root first, normalizes and caps extra routes', async () => {
+    const { loadRoutes, routeShotName } = await import('../src/preview/preview.js')
+    expect(loadRoutes(dir)).toEqual(['/'])
+    fs.mkdirSync(path.join(dir, '.squint'), { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, '.squint', 'routes'),
+      '# review these\n/pricing\nabout\n/\n/a\n/b\n/c\n/d\n/e\n',
+    )
+    const routes = loadRoutes(dir)
+    expect(routes[0]).toBe('/')
+    expect(routes).toContain('/pricing')
+    expect(routes).toContain('/about')
+    expect(routes.length).toBe(6) // capped
+
+    expect(routeShotName('/')).toBe('root')
+    expect(routeShotName('/pricing/plans')).toBe('pricing-plans')
+  })
+})
+
+const chrome = findChrome()
+
+describe.skipIf(!chrome)('screenshot (requires Chrome)', () => {
+  it('captures a local html file to png', { timeout: 90000, retry: 2 }, async () => {
+    const page = path.join(dir, 'page.html')
+    fs.writeFileSync(page, '<!doctype html><body style="background:#123456"><h1>squint</h1></body>')
+    const out = path.join(dir, 'shot.png')
+    const result = await screenshot(chrome!, `file://${page}`, out, { width: 800, height: 600 })
+    expect(result).toEqual({ ok: true })
+    expect(fs.statSync(out).size).toBeGreaterThan(1000)
+  })
+})
+
+describe('findChrome env override', () => {
+  it('prefers SQUINT_CHROME when it points at an executable, ignores it otherwise', () => {
+    const saved = process.env.SQUINT_CHROME
+    try {
+      process.env.SQUINT_CHROME = process.execPath // any executable proves the override path
+      expect(findChrome()).toBe(process.execPath)
+      process.env.SQUINT_CHROME = '/definitely/not/here/chrome'
+      expect(findChrome()).not.toBe('/definitely/not/here/chrome')
+    } finally {
+      if (saved === undefined) delete process.env.SQUINT_CHROME
+      else process.env.SQUINT_CHROME = saved
+    }
+  })
+})

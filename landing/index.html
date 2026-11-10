@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>squint: checks the page your coding agent just built</title>
+<meta name="description" content="A free, open-source terminal tool. After each turn of your coding agent it type-checks, reads the dev server, opens the page in headless Chrome, and tells the agent what is actually wrong.">
+<link rel="canonical" href="https://aayambansal.github.io/squint/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f2f2f2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141414" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="squint">
+<meta property="og:url" content="https://aayambansal.github.io/squint/">
+<meta property="og:title" content="squint checks the page your coding agent just built">
+<meta property="og:description" content="A free, open-source terminal tool that sits on top of the agent CLI you already use.">
+<meta property="og:image" content="https://aayambansal.github.io/squint/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="An eye chart whose lines are problems on a web page, from 'The page is blank' in large type down to small type.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23fff'/%3E%3Cpath d='M4 16Q16 9 28 16Q16 23 4 16Z' fill='none' stroke='%23000' stroke-width='2.6' stroke-linejoin='round'/%3E%3Cellipse cx='16' cy='16' rx='4.2' ry='2.7'/%3E%3C/svg%3E">
+<link rel="preload" href="fonts/atkinson-hyperlegible-next.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+  /* Atkinson Hyperlegible, served from this site. See fonts/OFL-*.txt. */
+  @font-face {
+    font-family: "Atkinson Hyperlegible Next";
+    src: url("fonts/atkinson-hyperlegible-next.woff2") format("woff2");
+    font-weight: 200 800; font-style: normal; font-display: swap;
+  }
+  @font-face {
+    font-family: "Atkinson Hyperlegible Mono";
+    src: url("fonts/atkinson-hyperlegible-mono.woff2") format("woff2");
+    font-weight: 200 800; font-style: normal; font-display: swap;
+  }
+
+  :root {
+    color-scheme: light dark;
+    --sans: "Atkinson Hyperlegible Next", system-ui, sans-serif;
+    --mono: "Atkinson Hyperlegible Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    /* A lit chart on a wall: the wall changes with the room, the chart does not. */
+    --wall: #f2f2f2;
+    --ink: #000;
+    --quiet: #555;
+    --line: #c9c9c9;
+    --panel: #fff;
+    --red: #b3202a;
+    --green: #17703a;
+    --chart: #fff;
+    --chart-ink: #000;
+    --chart-quiet: #555;
+    --chart-red: #c4262e;
+    --chart-green: #1d7a3e;
+    --chart-light: 0 0 0 1px #d6d6d6, 0 30px 60px -40px rgb(0 0 0 / 0.45);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --wall: #141414;
+      --ink: #f4f4f4;
+      --quiet: #cdcdcd;
+      --line: #3d3d3d;
+      --panel: #1e1e1e;
+      --red: #ffa8a8;
+      --green: #86dba0;
+      --chart-light: 0 0 0 1px #fff, 0 0 160px 6px rgb(255 255 255 / 0.16);
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; }
+  html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+  body {
+    background: var(--wall); color: var(--ink);
+    font-family: var(--sans); font-size: 1.125rem; line-height: 1.6;
+  }
+  a { color: inherit; text-decoration-thickness: 0.08em; text-underline-offset: 0.2em; }
+  a:hover { text-decoration-thickness: 0.16em; }
+  :focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; border-radius: 2px; }
+  code, pre, kbd { font-family: var(--mono); font-size: 0.92em; }
+  svg { display: block; }
+  .skip { position: absolute; left: 1rem; top: -5rem; background: var(--ink); color: var(--wall); padding: 0.7rem 1rem; z-index: 1; }
+  .skip:focus { top: 1rem; }
+
+  .page { padding-inline: clamp(1.1rem, 4vw, 2rem); }
+  .col { max-width: 43rem; margin-inline: auto; }
+  .wide { max-width: 64rem; margin-inline: auto; }
+  .col > * + * { margin-top: 1.1rem; }
+
+  /* ---------- the mark: an eye, narrowed ---------- */
+  .eye { color: inherit; flex: none; }
+  .lid {
+    fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round;
+    vector-effect: non-scaling-stroke;
+    transform-origin: 17px 11px; transform: scaleY(0.42);
+    transition: transform 0.35s ease-out;
+  }
+  .pupil {
+    fill: currentColor;
+    transform-origin: 17px 11px; transform: scaleY(0.56);
+    transition: transform 0.35s ease-out;
+  }
+  :root[data-relaxed] .lid, :root[data-relaxed] .pupil { transform: none; }
+
+  /* ---------- masthead ---------- */
+  .masthead { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 1.1rem; }
+  .name {
+    display: inline-flex; align-items: center; gap: 0.6rem; min-height: 2.75rem;
+    font-size: 1.3rem; font-weight: 700; text-decoration: none;
+  }
+  .masthead nav { display: flex; gap: 0.1rem; }
+  .masthead nav a { padding: 0.6rem 0.65rem; }
+
+  /* ---------- intro ---------- */
+  .intro { padding-block: clamp(1.75rem, 6vw, 4.5rem) clamp(2.5rem, 6vw, 4rem); }
+  h1 {
+    font-size: clamp(2.1rem, 5.4vw, 3.6rem); line-height: 1.04; font-weight: 800;
+    letter-spacing: -0.015em; text-wrap: balance;
+  }
+  .lead { font-size: 1.25rem; line-height: 1.5; text-wrap: pretty; }
+  .intro .lead { margin-top: 1.4rem; }
+  .run {
+    display: flex; align-items: stretch; max-width: 31rem;
+    border: 2px solid var(--ink); border-radius: 10px; background: var(--panel); overflow: hidden;
+  }
+  .intro .run { margin-top: 2rem; }
+  .run code { flex: 1; min-width: 0; padding: 0.9rem 0.9rem; font-size: clamp(0.86rem, 3.8vw, 1.02rem); font-weight: 500; white-space: nowrap; overflow-x: auto; }
+  .run button {
+    font: inherit; font-weight: 700; min-width: 5.25rem; padding: 0 1rem;
+    border: 0; border-left: 2px solid var(--ink); background: var(--ink); color: var(--wall); cursor: pointer;
+  }
+  .run button:focus-visible { outline-offset: -6px; outline-color: var(--wall); }
+  .fine { color: var(--quiet); font-size: 1rem; text-wrap: pretty; }
+
+  /* ---------- sections ---------- */
+  section { padding-block: clamp(2rem, 5vw, 3.25rem); }
+  h2 { font-size: clamp(1.6rem, 3.4vw, 2.1rem); line-height: 1.12; font-weight: 800; letter-spacing: -0.01em; text-wrap: balance; }
+  h3 { font-size: 1.2rem; line-height: 1.25; font-weight: 700; }
+  p { text-wrap: pretty; }
+  .block {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 1rem 1.1rem; font-size: 0.92rem; font-weight: 500; line-height: 1.75; overflow-x: auto;
+  }
+  .dim { color: var(--quiet); }
+  .bad { color: var(--red); }
+
+  /* ---------- the chart ---------- */
+  .chart-box { container-type: inline-size; margin-top: 2rem; }
+  .chart {
+    margin: 0; background: var(--chart); color: var(--chart-ink); border-radius: 14px;
+    padding: clamp(1.5rem, 5cqi, 3.25rem) clamp(1rem, 4cqi, 2.75rem);
+    box-shadow: var(--chart-light);
+  }
+  .lines { list-style: none; padding: 0; }
+  .lines li {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto) minmax(0, 1fr);
+    align-items: baseline; column-gap: 1rem;
+    /* Each line is 86% the size of the one above, like the chart it borrows from. */
+    font-size: 1.25rem;
+    font-size: max(calc(1.7rem * pow(0.93, var(--i) - 1)), calc(7.2cqi * pow(0.86, var(--i) - 1)));
+    padding-block: 0.26em;
+  }
+  .num, .by { font-family: var(--mono); font-size: 0.8rem; font-weight: 500; color: var(--chart-quiet); }
+  .by { justify-self: end; text-align: right; }
+  .what { font-weight: 700; line-height: 1.12; text-align: center; text-wrap: balance; transition: filter 0.5s ease-out; }
+  .lines .bar { padding-block: 0.7rem; align-items: center; font-size: 1rem; }
+  .bar-rule { grid-column: 2; display: block; width: min(34rem, 58cqi); height: 7px; }
+  .bar-note { grid-column: 3; justify-self: end; text-align: right; font-size: 0.8rem; font-weight: 700; line-height: 1.25; }
+  .bar-green .bar-rule { background: var(--chart-green); }
+  .bar-green .bar-note { color: var(--chart-green); }
+  .bar-red .bar-rule { background: var(--chart-red); }
+  .bar-red .bar-note { color: var(--chart-red); }
+  .chart[data-relaxed] .what { filter: blur(calc(max(0, var(--i) - 3) * 0.75px)); }
+  @container (max-width: 43rem) {
+    .lines li { grid-template-columns: minmax(0, 1fr); justify-items: center; row-gap: 0.1rem; }
+    .num { display: none; }
+    .by { justify-self: center; text-align: center; }
+    .bar-rule { grid-column: 1; width: 100%; }
+    .bar-note { grid-column: 1; justify-self: center; text-align: center; }
+  }
+  .chart-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1.5rem; margin-top: 1.25rem; }
+  .relax {
+    display: inline-flex; align-items: center; gap: 0.6rem; min-height: 2.75rem;
+    font: inherit; font-size: 1rem; font-weight: 700; color: var(--ink);
+    background: none; border: 2px solid var(--ink); border-radius: 999px; padding: 0.35rem 1.1rem; cursor: pointer;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    /* The page squints once on arrival: the lines come into focus from the top down. */
+    .what { animation: focus 1s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--i) * 60ms + 120ms); }
+    @keyframes focus { from { filter: blur(calc(var(--i) * 0.8px + 2px)); opacity: 0.45; } }
+  }
+
+  /* ---------- each turn ---------- */
+  .steps { padding-left: 1.6em; }
+  .steps li { padding-left: 0.35em; }
+  .steps li + li { margin-top: 0.7rem; }
+  .steps li::marker { font-family: var(--mono); font-weight: 700; }
+
+  /* ---------- the run ---------- */
+  .mistakes { list-style: none; padding: 0; margin-top: 2rem; }
+  .mistake {
+    display: grid; grid-template-columns: 12.5rem minmax(0, 1fr); gap: 1rem 2.5rem; align-items: start;
+    padding-block: 1.9rem; border-top: 1px solid var(--line);
+  }
+  .ill { width: 100%; height: auto; color: var(--ink); }
+  .ink { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .solid { fill: currentColor; }
+  .sheet { fill: var(--panel); stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
+  .white { fill: #fff; stroke: currentColor; stroke-width: 2; }
+  .greeked { fill: var(--line); }
+  .pen { fill: none; stroke: var(--red); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+  .pen-dash { fill: none; stroke: var(--red); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 4 4; }
+  .pen-text { fill: var(--red); font-family: var(--mono); font-size: 13px; font-weight: 700; }
+  .lab { fill: currentColor; font-family: var(--sans); font-size: 13px; font-weight: 700; }
+  .lab-big { fill: currentColor; font-family: var(--sans); font-size: 52px; font-weight: 800; }
+  .tag { fill: currentColor; font-family: var(--mono); font-size: 11.5px; font-weight: 500; }
+  .tag-faint { fill: var(--quiet); font-family: var(--mono); font-size: 11.5px; font-weight: 500; }
+  .pale { fill: #b4b4b4; font-family: Georgia, serif; font-size: 11.5px; }
+  .said-list { display: grid; gap: 0.5rem; margin-top: 0.75rem; }
+  .said {
+    display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 0.6rem 0.8rem; font-size: 0.88rem; font-weight: 500; line-height: 1.5; overflow-wrap: anywhere;
+  }
+  .kind { display: block; margin-top: 0.75rem; font-size: 0.9rem; font-weight: 700; }
+  .kind-hard { color: var(--red); }
+  .kind-soft { color: var(--quiet); }
+  .why { margin-top: 0.75rem; color: var(--quiet); font-size: 1.02rem; }
+  .extra { border-top: 1px solid var(--line); padding-top: 1.9rem; }
+
+  /* ---------- plain lists ---------- */
+  .plain { list-style: none; padding: 0; }
+  .plain li + li { margin-top: 1rem; }
+
+  /* ---------- colophon ---------- */
+  .colophon { border-top: 2px solid var(--ink); padding-block: 2rem 4rem; margin-top: 2rem; }
+  .links { display: flex; flex-wrap: wrap; gap: 0.25rem 1.5rem; list-style: none; padding: 0; }
+  .links a { display: inline-block; padding-block: 0.5rem; font-weight: 700; }
+
+  @media (max-width: 44rem) {
+    .mistake { grid-template-columns: minmax(0, 1fr); }
+    .ill { max-width: 13rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .lid, .pupil, .what { transition: none; }
+  }
+  @media print {
+    .masthead nav, .skip, .relax, .run button { display: none; }
+    .chart { box-shadow: 0 0 0 1px #000; }
+    .mistake { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="page" id="top">
+
+<header class="masthead wide">
+  <a class="name" href="#top" aria-label="squint, top of page">
+    <svg class="eye" width="34" height="22" viewBox="0 0 34 22" aria-hidden="true">
+      <path class="lid" d="M2 11Q17 -3 32 11"/>
+      <path class="lid" d="M2 11Q17 25 32 11"/>
+      <circle class="pupil" cx="17" cy="11" r="4.6"/>
+    </svg>
+    squint
+  </a>
+  <nav aria-label="Project">
+    <a href="https://github.com/aayambansal/squint">Source</a>
+    <a href="https://www.npmjs.com/package/@aayambansal/squint">npm</a>
+    <a href="https://github.com/aayambansal/squint/tree/main/docs">Docs</a>
+  </nav>
+</header>
+
+<main id="main">
+  <div class="intro col">
+    <h1>squint checks the page your coding agent just built.</h1>
+    <p class="lead">It is a terminal app that sits on top of the agent CLI you already use. After each
+      turn it runs your type checker and linter, reads your dev server's output, opens the page in
+      headless Chrome, and gives the agent a list of what is actually wrong.</p>
+    <div class="run">
+      <code id="command">npx @aayambansal/squint</code>
+      <button type="button" id="copy">Copy</button>
+    </div>
+    <p class="fine">Run it inside a frontend repo. It needs Node 22 or newer and one agent CLI.
+      It is free and MIT licensed, with no account and no telemetry.</p>
+  </div>
+
+  <section aria-labelledby="chart-h">
+    <div class="col">
+      <h2 id="chart-h">What a quick look misses</h2>
+      <p>Problems on a web page, in order of how easy they are to see. You would catch the top
+        lines yourself. squint is for the rest.</p>
+    </div>
+    <div class="wide chart-box">
+      <figure class="chart" id="chart">
+        <ol class="lines">
+          <li style="--i:1"><span class="num" aria-hidden="true">1</span><span class="what">The page is blank</span><span class="by">runtime probe</span></li>
+          <li style="--i:2"><span class="num" aria-hidden="true">2</span><span class="what">The build broke</span><span class="by">dev-server sweep</span></li>
+          <li style="--i:3"><span class="num" aria-hidden="true">3</span><span class="what">An error in the console</span><span class="by">runtime probe</span></li>
+          <li style="--i:4"><span class="num" aria-hidden="true">4</span><span class="what">A font file that 404s</span><span class="by">runtime probe</span></li>
+          <li class="bar bar-green" aria-hidden="true"><span class="bar-rule"></span><span class="bar-note">a glance gets about this far</span></li>
+          <li style="--i:5"><span class="num" aria-hidden="true">5</span><span class="what">A class with no CSS behind it</span><span class="by">phantom-class check</span></li>
+          <li style="--i:6"><span class="num" aria-hidden="true">6</span><span class="what">A text field with no label</span><span class="by">accessibility sweep</span></li>
+          <li style="--i:7"><span class="num" aria-hidden="true">7</span><span class="what">A focus ring you can't see</span><span class="by">keyboard walk</span></li>
+          <li class="bar bar-red" aria-hidden="true"><span class="bar-rule"></span><span class="bar-note">a careful look, about this far</span></li>
+          <li style="--i:8"><span class="num" aria-hidden="true">8</span><span class="what">Body text in pale gray</span><span class="by">contrast check</span></li>
+          <li style="--i:9"><span class="num" aria-hidden="true">9</span><span class="what">Links four pixels apart</span><span class="by">target spacing</span></li>
+          <li style="--i:10"><span class="num" aria-hidden="true">10</span><span class="what">An image that shoves the page as it loads</span><span class="by">image check</span></li>
+          <li style="--i:11"><span class="num" aria-hidden="true">11</span><span class="what">A div pretending to be a button</span><span class="by">accessibility sweep</span></li>
+        </ol>
+      </figure>
+      <div class="chart-foot">
+        <p class="fine">Beside each line is the check that catches it. Where the two bars sit is a
+          guess, not a measurement.</p>
+        <button class="relax" type="button" id="relax" aria-pressed="false" hidden>
+          <svg class="eye" width="34" height="22" viewBox="0 0 34 22" aria-hidden="true">
+            <path class="lid" d="M2 11Q17 -3 32 11"/>
+            <path class="lid" d="M2 11Q17 25 32 11"/>
+            <circle class="pupil" cx="17" cy="11" r="4.6"/>
+          </svg>
+          <span id="relax-label">Stop squinting</span>
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="turn-h">
+    <div class="col">
+      <h2 id="turn-h">What happens on each turn</h2>
+      <p>You type what you want changed. squint adds its design brief and your project's rules to the
+        request, takes a checkpoint of your files, and passes it to your agent. When the agent is
+        done, squint checks the result in this order:</p>
+      <ol class="steps">
+        <li><b>Types and lint.</b> Your project's own typecheck and lint scripts. This takes
+          seconds.</li>
+        <li><b>The dev server.</b> Once you start it with <code>/dev</code>, squint reads its
+          output for build errors that appeared during the turn.</li>
+        <li><b>The page.</b> If the build is clean, squint loads the page in headless Chrome and
+          looks for exceptions, console errors, failed requests, and the kinds of mistake shown
+          in the next section.</li>
+        <li><b>A screenshot.</b> Compared with the one from the turn before, so you can see how
+          much of the page changed and which element moved.</li>
+      </ol>
+      <p>Anything that fails goes into a list of problems. <code>/fix</code> sends that list to
+        the agent. If you turn on <code>autoFix</code>, squint sends it for you, twice at most per
+        request. <code>/undo</code> puts your files back.</p>
+      <p>It is the prompt, preview and fix loop that Lovable made familiar, run locally against
+        your own repo with the agent you already pay for.</p>
+    </div>
+  </section>
+
+  <section aria-labelledby="run-h">
+    <div class="col">
+      <h2 id="run-h">A run you can check</h2>
+      <p>This is a <a href="specimen/">small newsletter page</a> with nine mistakes planted in it.
+        Each one is marked with a comment in
+        <a href="https://github.com/aayambansal/squint/blob/main/landing/specimen/index.html">its source</a>.
+        Here is what squint 1.0.2, installed from npm, said about it.</p>
+<pre class="block"><span class="dim">$</span> npx @aayambansal/squint ci --url https://aayambansal.github.io/squint/specimen/
+<span class="bad">✗ audit: 2 hard finding(s)</span>
+  runtime: 1 failed request(s)
+  phantoms: btn-primery (on &lt;button&gt;)</pre>
+      <p>Those are the first lines it prints. It then exits with a failure and saves a JSON report
+        holding fourteen findings. The two above fail the run. The other twelve are advisories:
+        reported, not blocking. Below is each planted mistake next to squint's own words for it.</p>
+    </div>
+
+    <ol class="mistakes wide">
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="Large letters Aa beside a font file marked 404">
+          <text class="lab-big" x="14" y="82">Aa</text>
+          <path class="sheet" d="M124 20h34l20 20v62h-54z"/>
+          <path class="ink" d="M158 20v20h20"/>
+          <text class="tag" x="131" y="92">.woff2</text>
+          <text class="pen-text" x="136" y="66">404</text>
+          <path class="pen-dash" d="M116 62H92"/>
+        </svg>
+        <div>
+          <h3>The heading's font file does not exist</h3>
+          <span class="kind kind-hard">Fails the run</span>
+          <div class="said-list"><code class="said">runtime: 1 failed request(s)</code></div>
+          <p class="why">The heading still shows up, in a fallback font, so the page looks fine and
+            the missing file goes unnoticed.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="A plain unstyled button above the class name btn-primery, with the e struck through in red and an a written above it">
+          <rect class="sheet" x="14" y="16" width="156" height="34" rx="3"/>
+          <text class="lab" x="92" y="38" text-anchor="middle">Read the latest issue</text>
+          <text class="tag" x="14" y="98">class="btn btn-primery"</text>
+          <path class="pen" d="M151 103l7-15"/>
+          <text class="pen-text" x="151" y="80">a</text>
+        </svg>
+        <div>
+          <h3>A class name is misspelled</h3>
+          <span class="kind kind-hard">Fails the run</span>
+          <div class="said-list"><code class="said">phantoms: btn-primery (on &lt;button&gt;)</code></div>
+          <p class="why">It should be <code>btn-primary</code>. The button renders with none of its
+            styles, and nothing reports an error.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="A picture next to a speech bubble that holds only the file name, team dot svg">
+          <rect class="sheet" x="14" y="18" width="92" height="72" rx="4"/>
+          <circle class="ink" cx="84" cy="38" r="7"/>
+          <path class="ink" d="M22 82l24-30 17 20 11-11 24 21"/>
+          <path class="sheet" d="M116 26h74v38h-50l-12 12v-12h-12z"/>
+          <text class="tag" x="124" y="49">team.svg</text>
+          <path class="pen" d="M124 55h58"/>
+        </svg>
+        <div>
+          <h3>An image has no alt text</h3>
+          <span class="kind kind-soft">Advisory</span>
+          <div class="said-list"><code class="said">img missing alt: team.svg</code></div>
+          <p class="why">A screen reader either skips it or reads the file name aloud.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="Lines of text before an image loads, and the same lines pushed down the page after it loads">
+          <rect class="greeked" x="14" y="20" width="62" height="7" rx="3.5"/>
+          <rect class="greeked" x="14" y="34" width="54" height="7" rx="3.5"/>
+          <rect class="greeked" x="14" y="48" width="60" height="7" rx="3.5"/>
+          <rect class="sheet" x="104" y="14" width="68" height="46" rx="4"/>
+          <path class="ink" d="M110 54l16-20 11 13 8-8 20 15"/>
+          <rect class="greeked" x="104" y="72" width="62" height="7" rx="3.5"/>
+          <rect class="greeked" x="104" y="86" width="54" height="7" rx="3.5"/>
+          <rect class="greeked" x="104" y="100" width="60" height="7" rx="3.5"/>
+          <path class="pen" d="M186 22v52m-6-8l6 8 6-8"/>
+        </svg>
+        <div>
+          <h3>The same image has no width or height</h3>
+          <span class="kind kind-soft">Advisory</span>
+          <div class="said-list"><code class="said">image: &lt;img team.svg&gt; has no width/height or aspect-ratio — it reserves no space and shifts layout when it loads</code></div>
+          <p class="why">Whatever you were reading jumps down the page when the image arrives.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="A text field with placeholder text and an empty red outline where its label should be">
+          <rect class="pen-dash" x="14" y="20" width="74" height="22" rx="3"/>
+          <text class="pen-text" x="24" y="36">label?</text>
+          <rect class="sheet" x="14" y="52" width="172" height="38" rx="4"/>
+          <text class="tag-faint" x="26" y="76">you@example.com</text>
+        </svg>
+        <div>
+          <h3>A text field has no label</h3>
+          <span class="kind kind-soft">Advisory</span>
+          <div class="said-list"><code class="said">form control without label &lt;input.field&gt;</code></div>
+          <p class="why">A placeholder is not a label. It is gone as soon as you start typing, and
+            a screen reader may never announce it.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="A mouse pointer on underlined text, and a Tab key that cannot reach it">
+          <text class="lab" x="14" y="34">Show past issues</text>
+          <path class="ink" d="M14 40h108"/>
+          <path class="solid" d="M132 22v19l5-4.6 3.4 8 3.2-1.4-3.4-7.8h6.6z"/>
+          <rect class="sheet" x="14" y="70" width="56" height="34" rx="7"/>
+          <text class="tag" x="42" y="92" text-anchor="middle">Tab</text>
+          <path class="pen-dash" d="M80 87h54"/>
+          <path class="pen" d="M142 80l14 14m0-14l-14 14"/>
+        </svg>
+        <div>
+          <h3>A div is doing a button's job</h3>
+          <span class="kind kind-soft">Advisory</span>
+          <div class="said-list"><code class="said">clickable &lt;div.more&gt; is not focusable and has no role — unreachable without a mouse</code></div>
+          <p class="why">It works when you click it. It does not exist if you use a keyboard.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="Three navigation links and a Tab key, with a red dashed outline and a question mark where the focus ring should be">
+          <text class="lab" x="14" y="40">Issues</text>
+          <text class="lab" x="76" y="40">Archive</text>
+          <text class="lab" x="146" y="40">About</text>
+          <rect class="pen-dash" x="68" y="22" width="66" height="28" rx="4"/>
+          <text class="pen-text" x="124" y="16">?</text>
+          <rect class="sheet" x="14" y="70" width="56" height="34" rx="7"/>
+          <text class="tag" x="42" y="92" text-anchor="middle">Tab</text>
+        </svg>
+        <div>
+          <h3>The focus outline is switched off</h3>
+          <span class="kind kind-soft">Advisory, three times</span>
+          <div class="said-list"><code class="said">keyboard: focus invisible on &lt;a#nav-issues&gt; (tab stop 1) — outline and box-shadow both none</code></div>
+          <p class="why">The same line appears for the two links after it. squint found this by
+            pressing Tab on the page, not by reading the stylesheet.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="Two lines of very pale gray text on white, marked Lc 41 in red">
+          <rect class="white" x="14" y="14" width="172" height="58" rx="4"/>
+          <text class="pale" x="26" y="38">Written by two people who</text>
+          <text class="pale" x="26" y="56">would rather show you a</text>
+          <path class="pen" d="M14 84h60"/>
+          <text class="pen-text" x="14" y="106">Lc 41</text>
+        </svg>
+        <div>
+          <h3>Body text is set in pale gray</h3>
+          <span class="kind kind-soft">Advisory</span>
+          <div class="said-list"><code class="said">low APCA contrast: Lc 41 on &lt;p&gt; body text ("Written by two people who would rather s…") — fog, not elegance</code></div>
+          <p class="why">The drawing uses the real colors. Lc is a contrast score, and higher is
+            easier to read.</p>
+        </div>
+      </li>
+
+      <li class="mistake">
+        <svg class="ill" viewBox="0 0 200 120" role="img" aria-label="Four small squares packed close together, with a red circle the size of a fingertip covering two of them">
+          <rect class="solid" x="22" y="40" width="32" height="32" rx="3"/>
+          <rect class="solid" x="62" y="40" width="32" height="32" rx="3"/>
+          <rect class="solid" x="102" y="40" width="32" height="32" rx="3"/>
+          <rect class="solid" x="142" y="40" width="32" height="32" rx="3"/>
+          <circle class="pen-dash" cx="98" cy="56" r="24"/>
+          <text class="pen-text" x="126" y="26">24px</text>
+          <path class="ink" d="M22 86h32M22 82v8M54 82v8"/>
+          <text class="tag" x="24" y="106">16px</text>
+        </svg>
+        <div>
+          <h3>Four small links sit four pixels apart</h3>
+          <span class="kind kind-soft">Advisory, twice</span>
+          <div class="said-list">
+            <code class="said">4 interactive element(s) smaller than 24x24px</code>
+            <code class="said">target spacing: small tap targets sit closer than 24px apart (WCAG 2.5.8) — enlarge them or add spacing</code>
+          </div>
+          <p class="why">A fingertip covers two of them at once.</p>
+        </div>
+      </li>
+    </ol>
+
+    <div class="col extra">
+      <h3>Two it was not asked about</h3>
+      <p>Nine were planted and nine were found. The report also holds two lines for mistakes that
+        were not put there on purpose. Both are true.</p>
+      <div class="said-list">
+        <code class="said">font loading: @font-face "Notes Display" has no font-display and no size-adjust — text flashes invisible then reflows when the webfont loads (add font-display:swap + a metric-adjusted fallback)</code>
+        <code class="said">meta: no og:image — shared links render as a bare URL with no preview card</code>
+      </div>
+      <p>There are many more checks than these. The
+        <a href="https://github.com/aayambansal/squint/blob/main/docs/checks.md">check catalog</a>
+        lists every one and what it catches.</p>
+    </div>
+  </section>
+
+  <section aria-labelledby="try-h">
+    <div class="col">
+      <h2 id="try-h">Try it</h2>
+      <p>You need three things.</p>
+      <ul class="plain">
+        <li><b>Node 22 or newer.</b></li>
+        <li><b>One agent CLI, installed and signed in.</b> squint drives it and does not replace
+          it. Any of these works: Claude Code, Codex, Gemini CLI, Antigravity, OpenCode, Amp,
+          Cursor CLI, Copilot CLI or Aider. There are
+          <a href="https://github.com/aayambansal/squint/blob/main/docs/engines.md">setup notes for each</a>.</li>
+        <li><b>Chrome or Chromium</b> for the page checks. On a Mac, Edge and Brave work too.</li>
+      </ul>
+      <p>Then, in your project:</p>
+<pre class="block">cd your-project
+npx @aayambansal/squint</pre>
+      <p>Inside squint, type what you want in plain words. These commands cover most of a session:</p>
+<pre class="block">/dev        <span class="dim">start your dev server under squint</span>
+/review     <span class="dim">screenshots at 390, 768 and 1440 wide, then a critique</span>
+/problems   <span class="dim">what the checks found</span>
+/fix        <span class="dim">send the problems to the agent</span>
+/undo       <span class="dim">put your files back</span></pre>
+      <p><code>squint doctor</code> shows which agents and which browser it found on your machine.
+        To start from an empty folder instead, <code>npx @aayambansal/squint init my-app</code>
+        scaffolds a Vite, React and Tailwind project.</p>
+      <p class="fine">Built on macOS and tested on Linux in CI. Windows has not been tested.</p>
+    </div>
+  </section>
+
+  <section aria-labelledby="limits-h">
+    <div class="col">
+      <h2 id="limits-h">What it won't do</h2>
+      <ul class="plain">
+        <li><b>It does not write the code.</b> Your agent does, on your account and at your cost.
+          squint makes each request a little longer by adding its brief and your rules, and
+          <code>/context</code> shows how many tokens that adds.</li>
+        <li><b>It cannot tell you a page is good.</b> The checks measure what can be measured.
+          Whether the design is any good is still your call. <code>/review</code> helps, but it
+          is the agent judging screenshots of its own work.</li>
+        <li><b>It will be wrong sometimes.</b> The checks are heuristics. Expect the occasional
+          false alarm, and expect it to miss things.</li>
+        <li><b>It is one person's project.</b> It is at version 1.0.2 and changes often. Some of
+          what the repository describes is on the main branch and not on npm yet.</li>
+      </ul>
+      <p>If something is broken or confusing,
+        <a href="https://github.com/aayambansal/squint/issues">open an issue</a>.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="colophon col">
+  <p>squint is free and open source under the MIT license. It was made by
+    <a href="https://github.com/aayambansal">Aayam Bansal</a>.</p>
+  <ul class="links">
+    <li><a href="https://github.com/aayambansal/squint">Source</a></li>
+    <li><a href="https://www.npmjs.com/package/@aayambansal/squint">npm</a></li>
+    <li><a href="https://github.com/aayambansal/squint/tree/main/docs">Docs</a></li>
+    <li><a href="https://github.com/aayambansal/squint/blob/main/CHANGELOG.md">Changelog</a></li>
+    <li><a href="https://github.com/aayambansal/squint/blob/main/CONTRIBUTING.md">Contributing</a></li>
+  </ul>
+  <p class="fine">This page loads no trackers and makes no requests to other sites. It is set in
+    Atkinson Hyperlegible, a typeface the Braille Institute made to be easy to read with low vision.</p>
+</footer>
+
+</div>
+
+<script>
+  // Two small conveniences. The page reads the same without them.
+  const copy = document.getElementById('copy');
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(document.getElementById('command').textContent);
+      copy.textContent = 'Copied';
+    } catch {
+      copy.textContent = 'Not copied';
+    }
+    setTimeout(() => { copy.textContent = 'Copy'; }, 1800);
+  });
+
+  // Squinting sharpens what you look at. Relax, and the small lines go first.
+  const chart = document.getElementById('chart');
+  const relax = document.getElementById('relax');
+  const relaxLabel = document.getElementById('relax-label');
+  relax.hidden = false;
+  relax.addEventListener('click', () => {
+    const relaxed = chart.toggleAttribute('data-relaxed');
+    document.documentElement.toggleAttribute('data-relaxed', relaxed);
+    relax.setAttribute('aria-pressed', String(relaxed));
+    relaxLabel.textContent = relaxed ? 'Squint again' : 'Stop squinting';
+  });
+</script>
+</body>
+</html>

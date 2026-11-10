@@ -1,0 +1,82 @@
+/** Normalized event stream every engine adapter translates into. */
+export type AgentEvent =
+  | { type: 'status'; text: string }
+  /** Streaming fragment of in-progress assistant text. */
+  | { type: 'delta'; text: string }
+  /**
+   * Complete assistant text block. `streamed` marks blocks whose content
+   * already arrived as deltas, so renderers can dedupe.
+   */
+  | { type: 'text'; text: string; streamed?: boolean }
+  | { type: 'thinking'; text: string }
+  | { type: 'tool'; name: string; detail?: string }
+  | {
+      type: 'result'
+      ok: boolean
+      summary?: string
+      sessionId?: string
+      costUsd?: number
+      durationMs?: number
+    }
+  | { type: 'error'; text: string }
+  | { type: 'raw'; data: unknown }
+
+/**
+ * How much the engine may do: plan = read-only investigation,
+ * safe = edits auto-approved inside the workspace (the default),
+ * yolo = no approval friction at all.
+ */
+export type RunMode = 'plan' | 'safe' | 'yolo'
+
+export interface RunOptions {
+  prompt: string
+  cwd: string
+  model?: string
+  mode?: RunMode
+  /** Session to resume, for engines that support it. */
+  sessionId?: string
+  /**
+   * Standing instructions for engines that can take them out of band
+   * (`supportsSystemPrompt`): the design brief rides here on every turn,
+   * so it survives context compaction and never bloats the transcript.
+   */
+  systemPrompt?: string
+}
+
+/** Stateful per-run line parser: one instance per spawned process. */
+export type LineParser = (line: string) => AgentEvent[]
+
+export interface Engine {
+  id: string
+  name: string
+  /** Binary looked up on PATH. */
+  binary: string
+  /** Alternate binary names to try when `binary` is absent. */
+  altBinaries?: string[]
+  /** How to install it, shown by `squint doctor`. */
+  install: string
+  supportsResume: boolean
+  /** Accepts `RunOptions.systemPrompt` (e.g. Claude's --append-system-prompt). */
+  supportsSystemPrompt?: boolean
+  /** Extra environment for every run of this engine. */
+  env?: Record<string, string>
+  /**
+   * Rewrites the spawn for engines that need a wrapper process —
+   * e.g. a pty via `script` for CLIs that gate stdout on isatty().
+   */
+  wrapCommand?(binaryPath: string, args: string[]): { binary: string; args: string[] }
+  buildArgs(opts: RunOptions): string[]
+  /**
+   * Create a parser for one run. Engines that emit plain text leave this
+   * undefined and the runner forwards stdout lines as `text` events.
+   */
+  createParser?(): LineParser
+}
+
+export interface AgentResult {
+  ok: boolean
+  sessionId?: string
+  costUsd?: number
+  durationMs?: number
+  error?: string
+}

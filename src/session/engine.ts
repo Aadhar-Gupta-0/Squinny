@@ -1,0 +1,1719 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { buildFixPrompt, DevServer, type DevServerState, detectDevCommand } from '../devserver/devserver.js'
+import { getEngine } from '../engines/registry.js'
+import type { AgentEvent, RunMode } from '../engines/types.js'
+import { buildGatePrompt, detectFastGates, detectGates, runGates } from '../gates/gates.js'
+import {
+  comparePulseAttributed,
+  buildReviewPrompt,
+  type ProbeResult,
+  buildRuntimeFixPrompt,
+  type CaptureResult,
+  captureViewports,
+  probeRuntime,
+  runtimeSummary,
+} from '../preview/preview.js'
+import { placeBrief } from '../prompt/brief.js'
+import { reviewGuidance } from '../prompt/library/index.js'
+import { appendDecision } from './designLog.js'
+import { runHook } from './hooks.js'
+import { enrich } from '../prompt/skills.js'
+import { runAgent } from '../runner/run.js'
+import { clearState, loadState, saveState } from '../state/state.js'
+import {
+  applySandbox,
+  discardSandbox,
+  openSandbox,
+  sandboxDiffStat,
+  sandboxDir,
+  sandboxExists,
+  sandboxFiles,
+} from '../vcs/sandbox.js'
+import { diffStatSince, isGitRepo, restoreSnapshot, type Snapshot, takeSnapshot } from '../vcs/snapshot.js'
+import { applyVariant, cleanVariants, listVariants, runVariants } from '../variants/variants.js'
+import { screenshotVariants } from '../variants/shots.js'
+import { findChrome } from '../preview/chrome.js'
+
+export type TranscriptRole = 'user' | 'assistant' | 'status' | 'tool' | 'error' | 'thinking' | 'image'
+
+export interface TranscriptItem {
+  id: number
+  role: TranscriptRole
+  text: string
+}
+
+export interface SessionTotals {
+  costUsd: number
+  turns: number
+}
+
+export type ProblemSource = 'gates' | 'dev' | 'runtime' | 'a11y' | 'flow' | 'check'
+
+export interface Problem {
+  id: number
+  source: ProblemSource
+  summary: string
+}
+
+export interface SessionState {
+  items: TranscriptItem[]
+  liveText: string
+  running: boolean
+  runStartedAt: number
+  engineId: string
+  model?: string
+  devState: DevServerState
+  devUrl: string | null
+  totals: SessionTotals
+  /** Asks typed while a turn runs; dispatched in order afterward. */
+  queue: string[]
+  /** How much the engine may do this session. */
+  mode: RunMode
+  /** Open findings from gates, the dev server, the runtime, and a11y sweeps. */
+  problems: Problem[]
+  /** Asks accumulate in a shadow worktree until /sandbox apply. */
+  sandbox: boolean
+  /** An engine-requested visual approval awaiting /yes or /no. */
+  pendingApproval: string | null
+}
+
+export interface SessionOptions {
+  cwd: string
+  engineId: string
+  model?: string
+  autoDev?: boolean
+  autoFix?: boolean
+  autoProbe?: boolean
+  /** Run typecheck+lint after every turn (default on where detected). */
+  autoCheck?: boolean
+  /** Session budget in USD; crossing it warns (never blocks). */
+  budgetUsd?: number
+  /** Auto-run /review when the visual pulse shows a big change. */
+  autoReview?: boolean
+  /** Cheaper model for fix turns (the mechanical tier). */
+  fixModel?: string
+  /** Inject the bundled design library on matching asks (default true). */
+  bundledSkills?: boolean
+  /** Called when a /quit-style command asks the frontend to close. */
+  onQuit?: () => void
+}
+
+const MAX_AUTO_FIX_ATTEMPTS = 2
+/** With a standing /goal armed, squint is the evaluator — press harder. */
+const MAX_GOAL_FIX_ATTEMPTS = 6
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * The harness core: owns the transcript, turn orchestration, the
+ * dev-server/probe fix loop, and every slash command. Framework-free —
+ * frontends subscribe and render. This is the piece the TUI, headless
+ * runs, and tests all share.
+ */
+export class Session {
+  private state: SessionState
+  private listeners = new Set<() => void>()
+  private nextId = 0
+  private live = ''
+  private sessionId: string | undefined
+  private dev: DevServer | null = null
+  private abort: AbortController | null = null
+  /** Full problem records; state carries the summaries. */
+  private problemPrompts = new Map<number, string>()
+  private nextProblemId = 0
+  private checkpoints: Array<{ snapshot: Snapshot; label: string; at: number }> = []
+  private fixAttempts = 0
+  private reviewTipShown = false
+  private goal: string | null = null
+  private laneEnabled = false
+  private inLane = false
+  private lastPulse: Buffer | null = null
+  private lastPerf: { lcpMs?: number; cls?: number; transferBytes?: number } | null = null
+  private autoReviewedThisAsk = false
+  /** Asks submitted this session; the first one carries the foundation-first addendum. */
+  private asksSent = 0
+  private readonly startedAt = Date.now()
+
+  constructor(private readonly opts: SessionOptions) {
+    this.state = {
+      items: [],
+      liveText: '',
+      running: false,
+      runStartedAt: 0,
+      engineId: opts.engineId,
+      model: opts.model,
+      devState: 'stopped',
+      pendingApproval: null,
+      devUrl: null,
+      totals: { costUsd: 0, turns: 0 },
+      queue: [],
+      mode: 'safe',
+      problems: [],
+      sandbox: false,
+    }
+    if (opts.autoDev && detectDevCommand(opts.cwd)) {
+      this.devServer().start()
+    }
+    const saved = loadState(opts.cwd)
+    if (saved) {
+      try {
+        if (getEngine(saved.engine).supportsResume) {
+          const mins = Math.max(1, Math.round((Date.now() - saved.at) / 60000))
+          this.push(
+            'status',
+            `previous session (${mins}m ago${saved.lastAsk ? ` · "${saved.lastAsk}"` : ''}) — /resume to continue`,
+          )
+        }
+      } catch {
+        // engine no longer exists; ignore stale state
+      }
+    }
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  getState(): SessionState {
+    return this.state
+  }
+
+  dispose(): void {
+    this.abort?.abort()
+    this.dev?.stop()
+  }
+
+  interrupt(): void {
+    this.abort?.abort()
+  }
+
+  /** Frontend-originated status line (view-level commands like /theme). */
+  note(text: string): void {
+    this.push('status', text)
+  }
+
+  /** Register a finding; a fresh finding from a source supersedes its old one. */
+  private addProblem(source: ProblemSource, summary: string, prompt: string): void {
+    const kept = this.state.problems.filter((p) => p.source !== source)
+    for (const gone of this.state.problems) {
+      if (gone.source === source) this.problemPrompts.delete(gone.id)
+    }
+    this.nextProblemId += 1
+    this.problemPrompts.set(this.nextProblemId, prompt)
+    this.notify({ problems: [...kept, { id: this.nextProblemId, source, summary }] })
+    runHook(this.opts.cwd, 'on-problem', { source, summary })
+  }
+
+  private clearProblems(source: ProblemSource): void {
+    const removed = this.state.problems.filter((p) => p.source === source)
+    if (removed.length === 0) return
+    for (const problem of removed) this.problemPrompts.delete(problem.id)
+    this.notify({ problems: this.state.problems.filter((p) => p.source !== source) })
+  }
+
+  /** One prompt covering the given problems, oldest first. */
+  private combinedFixPrompt(problems: Problem[]): string {
+    const sections = problems.map(
+      (p) => this.problemPrompts.get(p.id) ?? `Fix this reported problem: ${p.summary}`,
+    )
+    return sections.join('\n\n---\n\n')
+  }
+
+  private dispatchFix(problems: Problem[]): void {
+    if (problems.length === 0) return
+    const prompt = this.combinedFixPrompt(problems)
+    const fixModel = this.opts.fixModel
+    const display = `⛑ fix: ${problems.map((p) => p.source).join(' + ')}${fixModel ? ` · ${fixModel}` : ''}`
+    for (const problem of problems) this.problemPrompts.delete(problem.id)
+    this.notify({ problems: this.state.problems.filter((p) => !problems.includes(p)) })
+    void this.runTurn(prompt, display, fixModel)
+  }
+
+  /** Launch a capped auto-fix turn over all open problems. Returns true if launched. */
+  private maybeAutoFix(): boolean {
+    const cap = this.goal ? MAX_GOAL_FIX_ATTEMPTS : MAX_AUTO_FIX_ATTEMPTS
+    if (!this.opts.autoFix || this.fixAttempts >= cap) return false
+    if (this.state.problems.length === 0) return false
+    this.fixAttempts += 1
+    this.push('status', `auto-fix attempt ${this.fixAttempts}/${cap}${this.goal ? ' (goal armed)' : ''}`)
+    this.notify({ running: false })
+    this.dispatchFix([...this.state.problems])
+    return true
+  }
+
+  /**
+   * A side question: read-only, no session resume, so the main thread's
+   * context is untouched (Cursor's /btw). Costs count; loops don't run.
+   */
+  private async btw(question: string): Promise<void> {
+    this.push('user', `💬 btw: ${question}`)
+    this.notify({ running: true, runStartedAt: Date.now() })
+    const engine = getEngine(this.state.engineId)
+    this.abort = new AbortController()
+    const result = await runAgent(
+      engine,
+      {
+        prompt: `Answer this question about the repository. Investigate as needed but make no changes:\n\n${question}`,
+        cwd: this.execCwd(),
+        model: this.state.model,
+        mode: 'plan',
+      },
+      this.handleEvent,
+      this.abort.signal,
+    )
+    this.abort = null
+    this.commitLive()
+    this.flushToolCollapse()
+    if (result.ok) {
+      const cost = result.costUsd !== undefined ? ` · $${result.costUsd.toFixed(2)}` : ''
+      this.push('status', `btw answered${cost}`)
+      this.notify({
+        totals: { costUsd: this.state.totals.costUsd + (result.costUsd ?? 0), turns: this.state.totals.turns },
+      })
+    }
+    this.notify({ running: false })
+    this.drainQueue()
+  }
+
+  /**
+   * Unattended polish: n rounds of screenshot-review-fix. Each round is
+   * a full review turn (its own cost); the per-ask auto-fix cap resets
+   * per round so fixes still flow. Fire it and step away.
+   */
+  private async polish(rounds: number): Promise<void> {
+    for (let round = 1; round <= rounds; round++) {
+      this.fixAttempts = 0
+      const result = await this.capture()
+      if (!result) {
+        this.push('status', `polish stopped at round ${round}: nothing to capture`)
+        return
+      }
+      await this.runTurn(this.reviewPrompt(result), `👁 polish round ${round}/${rounds}`)
+    }
+    this.push('status', `polish complete — ${rounds} round${rounds === 1 ? '' : 's'} of review and fixes`)
+  }
+
+  /**
+   * The self-critique prompt: screenshots + every deterministic finding,
+   * closed by the review standards (the taste rubric and the checklist of
+   * each platform this repo targets) so critique is graded, not vibes.
+   */
+  private reviewPrompt(result: CaptureResult, focus?: string): string {
+    const base = buildReviewPrompt(
+      result.shots,
+      focus,
+      result.runtime,
+      result.a11y,
+      result.slop,
+      result.narration,
+      result.phantoms,
+      result.viewTransitions,
+      result.components,
+      result.webmcp,
+      result.jank,
+      result.locale,
+      result.speculation,
+      result.containers,
+      result.security,
+    )
+    return this.opts.bundledSkills === false ? base : base + reviewGuidance(this.execCwd())
+  }
+
+  setMode(mode: RunMode): void {
+    this.notify({ mode })
+    const hint =
+      mode === 'plan'
+        ? 'read-only: the engine investigates and proposes, edits nothing'
+        : mode === 'yolo'
+          ? 'no approval friction — the engine can do anything'
+          : 'edits auto-approved inside the workspace'
+    this.push('status', `mode → ${mode} · ${hint}`)
+  }
+
+  cycleMode(): void {
+    const order: RunMode[] = ['safe', 'plan', 'yolo']
+    const next = order[(order.indexOf(this.state.mode) + 1) % order.length]!
+    this.setMode(next)
+  }
+
+  /** One-line goodbye: what this session amounted to. */
+  summary(): string {
+    const mins = Math.max(1, Math.round((Date.now() - this.startedAt) / 60000))
+    const { turns, costUsd } = this.state.totals
+    const parts = [`${turns} turn${turns === 1 ? '' : 's'}`]
+    if (costUsd > 0) parts.push(`$${costUsd.toFixed(2)}`)
+    parts.push(`${mins}m`)
+    return `session: ${parts.join(' · ')}`
+  }
+
+  /**
+   * Route one line of user input: slash command or an ask for the engine.
+   * Asks arriving mid-turn queue up and dispatch in order once the
+   * current turn (including its fix cycle) settles.
+   */
+  input(raw: string): void {
+    const value = raw.trim()
+    if (value.length === 0) return
+    if (this.state.running) {
+      if (value === '/queue clear') {
+        this.notify({ queue: [] })
+        this.push('status', 'queue cleared')
+        return
+      }
+      const drop = /^\/queue drop (\d+)$/.exec(value)
+      if (drop) {
+        const index = Number.parseInt(drop[1]!, 10) - 1
+        if (index >= 0 && index < this.state.queue.length) {
+          const removed = this.state.queue[index]!
+          this.notify({ queue: this.state.queue.filter((_, i) => i !== index) })
+          this.push('status', `dropped from queue: ${removed}`)
+        } else {
+          this.push('status', `queue has ${this.state.queue.length} item(s) — /queue drop <1-${Math.max(this.state.queue.length, 1)}>`)
+        }
+        return
+      }
+      this.notify({ queue: [...this.state.queue, value] })
+      return
+    }
+    if (value.startsWith('/')) {
+      this.command(value)
+    } else {
+      void this.submit(value)
+    }
+  }
+
+  /** Dispatch queued input after the current work settles. */
+  private drainQueue(): void {
+    if (this.state.running) return
+    const [next, ...rest] = this.state.queue
+    if (next === undefined) return
+    this.notify({ queue: rest })
+    this.input(next)
+  }
+
+  // ---------- internals ----------
+
+  private notify(patch: Partial<SessionState>): void {
+    this.state = { ...this.state, ...patch }
+    for (const listener of this.listeners) listener()
+  }
+
+  private push(role: TranscriptRole, text: string): void {
+    this.nextId += 1
+    this.notify({ items: [...this.state.items, { id: this.nextId, role, text }] })
+  }
+
+  private setLive(text: string): void {
+    this.live = text
+    this.notify({ liveText: text })
+  }
+
+  /**
+   * Static transcript items are immutable once rendered, so in-progress
+   * assistant text accumulates in a live buffer and commits as one block.
+   */
+  private commitLive(): void {
+    if (this.live.length > 0) {
+      const text = this.live
+      this.live = ''
+      this.state = { ...this.state, liveText: '' }
+      this.push('assistant', text)
+    }
+  }
+
+  /** Where engines run and servers start: the sandbox worktree when on. */
+  private execCwd(): string {
+    return this.state.sandbox ? sandboxDir(this.opts.cwd) : this.opts.cwd
+  }
+
+  private devServer(): DevServer {
+    if (!this.dev) {
+      this.dev = new DevServer(this.execCwd(), {
+        onStateChange: (devState) => this.notify({ devState }),
+        onUrl: (url) => this.notify({ devUrl: url }),
+      })
+    }
+    return this.dev
+  }
+
+  /** Rebind the dev server after the execution tree changes. */
+  private resetDevServer(): void {
+    const wasRunning = this.dev && this.dev.state !== 'stopped'
+    this.dev?.stop()
+    this.dev = null
+    this.notify({ devUrl: null, devState: 'stopped' })
+    if (wasRunning) {
+      const command = detectDevCommand(this.execCwd())
+      if (command) {
+        this.devServer().start(command)
+        this.push('status', `dev server restarting in ${this.state.sandbox ? 'the sandbox' : 'the real tree'}`)
+      }
+    }
+  }
+
+  private turnEdits = 0
+  private turnTools = 0
+  private toolStreak = 0
+  private collapsedTools = 0
+
+  /**
+   * Long tool cascades collapse: the first three of a consecutive burst
+   * render, the rest fold into one "+N more" line pushed when the burst
+   * ends — append-only, so the Static transcript stays valid.
+   */
+  private flushToolCollapse(): void {
+    if (this.collapsedTools > 0) {
+      this.push('tool', `+${this.collapsedTools} more tool call${this.collapsedTools === 1 ? '' : 's'}`)
+      this.collapsedTools = 0
+    }
+    this.toolStreak = 0
+  }
+
+  private handleEvent = (event: AgentEvent): void => {
+    switch (event.type) {
+      case 'status':
+        this.commitLive()
+        this.flushToolCollapse()
+        this.push('status', event.text)
+        break
+      case 'delta':
+        this.setLive(this.live + event.text)
+        break
+      case 'text':
+        this.flushToolCollapse()
+        if (event.streamed) {
+          this.live = ''
+          this.state = { ...this.state, liveText: '' }
+          this.push('assistant', event.text)
+        } else {
+          this.setLive(this.live + (this.live.length > 0 ? '\n' : '') + event.text)
+        }
+        break
+      case 'thinking':
+        this.commitLive()
+        this.flushToolCollapse()
+        this.push('thinking', event.text)
+        break
+      case 'tool': {
+        this.commitLive()
+        this.turnTools += 1
+        this.toolStreak += 1
+        if (/edit|write|patch|apply/i.test(event.name)) this.turnEdits += 1
+        if (this.toolStreak <= 3) {
+          this.push('tool', event.detail ? `${event.name} · ${event.detail}` : event.name)
+        } else {
+          this.collapsedTools += 1
+        }
+        break
+      }
+      case 'error':
+        this.commitLive()
+        this.flushToolCollapse()
+        this.push('error', event.text)
+        break
+      case 'result':
+        if (event.sessionId) this.sessionId = event.sessionId
+        break
+      case 'raw':
+        break
+    }
+  }
+
+  /**
+   * Run one engine turn. `display` is what the transcript shows as the
+   * ask. The design brief is placed per engine capability (system prompt
+   * → every turn; resumable → first turn; cold engines → every turn), so
+   * fix and review turns are graded against the same standards as asks.
+   * `fresh` runs outside the session — no resume, and the returned
+   * session id is discarded — for reviewers that must not inherit context.
+   */
+  private async runTurn(
+    body: string,
+    display: string,
+    modelOverride?: string,
+    opts: { firstAsk?: boolean; fresh?: boolean } = {},
+  ): Promise<void> {
+    this.push('user', display)
+    this.turnEdits = 0
+    this.turnTools = 0
+    this.notify({ running: true, runStartedAt: Date.now() })
+    const runStart = Date.now()
+    const engine = getEngine(this.state.engineId)
+    const resumeId = engine.supportsResume && !opts.fresh ? this.sessionId : undefined
+    const placement = placeBrief(engine, body, {
+      cwd: this.opts.cwd,
+      sessionStarted: resumeId !== undefined,
+      firstAsk: opts.firstAsk ?? false,
+    })
+    this.abort = new AbortController()
+    const mainSessionId = this.sessionId
+    const result = await runAgent(
+      engine,
+      {
+        prompt: placement.prompt,
+        systemPrompt: placement.systemPrompt,
+        cwd: this.execCwd(),
+        model: modelOverride ?? this.state.model,
+        mode: this.state.mode,
+        sessionId: resumeId,
+      },
+      this.handleEvent,
+      this.abort.signal,
+    )
+    // A fresh run may have opened a session of its own; the main thread keeps its id.
+    if (opts.fresh) this.sessionId = mainSessionId
+    this.abort = null
+    this.commitLive()
+    this.flushToolCollapse()
+    if (result.ok) {
+      const cost = result.costUsd !== undefined ? ` · $${result.costUsd.toFixed(2)}` : ''
+      const secs = result.durationMs !== undefined ? ` · ${(result.durationMs / 1000).toFixed(0)}s` : ''
+      // Prefer measured reality (git diff vs this ask's checkpoint) over
+      // tool-call counting; fall back to counts outside git.
+      const checkpoint = this.checkpoints.at(-1)
+      const stat = checkpoint ? diffStatSince(this.opts.cwd, checkpoint.snapshot) : null
+      const work = stat
+        ? ` · ${stat}`
+        : this.turnEdits > 0
+          ? ` · ${this.turnEdits} edit${this.turnEdits === 1 ? '' : 's'}`
+          : this.turnTools > 0
+            ? ` · ${this.turnTools} tool call${this.turnTools === 1 ? '' : 's'}`
+            : ''
+      this.push('status', `done${secs}${cost}${work}`)
+      // Agent-initiated blocking approval: the engine wrote a request
+      // file and ended its turn; render it and wait for a human verdict.
+      try {
+        const reqPath = path.join(this.opts.cwd, '.squint', 'approval-request.json')
+        if (fs.existsSync(reqPath)) {
+          const req = JSON.parse(fs.readFileSync(reqPath, 'utf8'))
+          fs.rmSync(reqPath, { force: true })
+          if (typeof req?.summary === 'string' && req.summary.length > 0) {
+            this.notify({ pendingApproval: req.summary })
+            const shot = typeof req.screenshot === 'string' ? path.resolve(this.execCwd(), req.screenshot) : null
+            if (shot && fs.existsSync(shot)) this.push('image', shot)
+            this.push('status', `⏸ approval requested: ${req.summary}\n/yes approves · /no rejects · or type feedback`)
+          }
+        }
+      } catch {
+        // malformed requests are ignored
+      }
+      // Token drift guard: hardcoded colors in this turn's additions get
+      // pointed at the nearest existing token. Style pressure, not a gate.
+      if (checkpoint) {
+        try {
+          const { driftSummary, loadTokenIndex, scanDrift } = await import('../quality/tokens.js')
+          const index = loadTokenIndex(this.execCwd())
+          const drift = scanDrift(this.execCwd(), checkpoint.snapshot.stashHash ?? 'HEAD', index)
+          if (drift.length > 0) {
+            this.push('status', `token drift: ${drift.length} hardcoded color(s)\n${driftSummary(drift)}`)
+          }
+        } catch {
+          // never blocks the loop
+        }
+        // The sentinel watches what the engine DID: gate evasion surfaces
+        // loudly for the human and never enters auto-fix.
+        try {
+          const { scanEvasion, sentinelSummary } = await import('../quality/sentinel.js')
+          const evasions = scanEvasion(this.execCwd(), checkpoint.snapshot.stashHash ?? 'HEAD')
+          if (evasions.length > 0) {
+            this.push('error', `⚠ sentinel: ${evasions.length} gate-evasion pattern(s) this turn\n${sentinelSummary(evasions)}\nReview before trusting green — /undo rolls the turn back.`)
+            runHook(this.opts.cwd, 'on-sentinel', { count: String(evasions.length), summary: sentinelSummary(evasions) })
+          }
+        } catch {
+          // never blocks the loop
+        }
+        // Version-aware rule-packs: v3-era Tailwind in a v4 project (and
+        // retired Vite idioms) caught at gate time with the rename in hand.
+        try {
+          const { rulePackSummary, scanRulePacks } = await import('../quality/rulepacks.js')
+          const findings = scanRulePacks(this.execCwd(), checkpoint.snapshot.stashHash ?? 'HEAD')
+          const hard = findings.filter((f) => f.hard)
+          if (hard.length > 0) {
+            this.addProblem(
+              'gates',
+              `${hard.length} class(es)/idiom(s) from an older toolchain major\n${rulePackSummary(hard)}`,
+              `This project's toolchain is newer than the patterns just written. Apply the exact renames below — do not downgrade dependencies or add compatibility configs:\n${rulePackSummary(hard)}`,
+            )
+          }
+          const soft = findings.filter((f) => !f.hard)
+          if (soft.length > 0) {
+            this.push('status', `renamed-scale traps (verify intent):\n${rulePackSummary(soft)}`)
+          }
+        } catch {
+          // never blocks the loop
+        }
+      }
+      runHook(this.opts.cwd, 'on-turn-end', {
+        cost: String(result.costUsd ?? 0),
+        duration_ms: String(result.durationMs ?? 0),
+        stat: stat ?? '',
+      })
+      const before = this.state.totals.costUsd
+      this.notify({
+        totals: {
+          costUsd: before + (result.costUsd ?? 0),
+          turns: this.state.totals.turns + 1,
+        },
+      })
+      const budget = this.opts.budgetUsd
+      if (budget && before < budget && this.state.totals.costUsd >= budget) {
+        this.push(
+          'error',
+          `session cost $${this.state.totals.costUsd.toFixed(2)} crossed your $${budget.toFixed(2)} budget — squint keeps working, this is just the flag you asked for`,
+        )
+        runHook(this.opts.cwd, 'on-budget', { total: this.state.totals.costUsd.toFixed(2), budget: budget.toFixed(2) })
+      }
+      if (this.sessionId) {
+        saveState(this.opts.cwd, {
+          engine: this.state.engineId,
+          sessionId: this.sessionId,
+          model: this.state.model,
+          lastAsk: display.length > 80 ? `${display.slice(0, 79)}…` : display,
+          totals: this.state.totals,
+          at: Date.now(),
+        })
+      }
+    }
+
+    // Fastest verifier first: deterministic compile/lint checks on every
+    // turn (the dyad pre-loop), before any browser-level feedback.
+    if (result.ok && this.opts.autoCheck !== false) {
+      const fastGates = detectFastGates(this.execCwd())
+      if (fastGates.length > 0) {
+        const gateResults = await runGates(this.execCwd(), fastGates)
+        const failures = gateResults.filter((r) => !r.ok)
+        if (failures.length > 0) {
+          this.addProblem(
+            'gates',
+            failures.map((f) => f.gate.id).join(' + '),
+            buildGatePrompt(failures),
+          )
+          this.push(
+            'error',
+            failures.map((f) => `✗ ${f.gate.id} · ${f.outputTail.split('\n').slice(-3).join('\n')}`).join('\n'),
+          )
+          if (this.maybeAutoFix()) return
+          this.push('status', '/fix sends open problems to the engine · /problems lists them')
+          this.notify({ running: false })
+          this.drainQueue()
+          return
+        }
+        this.clearProblems('gates')
+      }
+    }
+
+    // The Lovable loop: give the dev server a moment to rebuild, then
+    // sweep for fresh errors and route them back to the engine.
+    const dev = this.dev
+    if (result.error !== 'interrupted' && dev && (dev.state === 'running' || dev.state === 'starting')) {
+      await delay(1500)
+      const errors = dev.errorsSince(runStart)
+      // Next 16+ publishes its own structured channel on the dev server;
+      // framework-reported errors beat log scraping when both exist.
+      if (this.state.devUrl) {
+        try {
+          const { hasNextMcp, probeNextMcp } = await import('../preview/nextMcp.js')
+          if (hasNextMcp(this.execCwd())) {
+            const mcp = await probeNextMcp(this.state.devUrl)
+            if (mcp.available && mcp.errors.length > 0) {
+              for (const err of mcp.errors) errors.push(`[next mcp] ${err}`)
+            }
+          }
+        } catch {
+          // the channel is a bonus, never a blocker
+        }
+      }
+      if (errors.length > 0) {
+        this.addProblem(
+          'dev',
+          `${errors.length} dev server error line(s)`,
+          buildFixPrompt(errors, dev.tail(30)),
+        )
+        this.push('error', `dev server: ${errors.length} error line(s)\n${errors.slice(-5).join('\n')}`)
+        if (this.maybeAutoFix()) return
+        this.push('status', '/fix sends open problems to the engine · /problems lists them')
+      } else {
+        this.clearProblems('dev')
+        // Build output is clean — probe the page itself for client-side
+        // breakage the server never sees (blank page, exceptions, 404s).
+        if (this.opts.autoProbe !== false && this.state.devUrl) {
+          const probe = await probeRuntime(this.state.devUrl, this.opts.cwd)
+          if (probe?.checkFailures && probe.checkFailures.length > 0) {
+            this.addProblem(
+              'check',
+              `${probe.checkFailures.length} persistent check failure(s)`,
+              `Repo checks in .squint/checks/ failed against the live page. Each line is <check>: <failure>:\n\n${probe.checkFailures.join('\n')}\n\nFix the page (or, only if the assertion itself is genuinely outdated, update that check file and say so).`,
+            )
+            this.push('error', `checks: ${probe.checkFailures.length} failure(s)\n${probe.checkFailures.slice(0, 5).join('\n')}`)
+          } else {
+            this.clearProblems('check')
+          }
+          const summary = probe ? runtimeSummary(probe.report) : null
+          if (probe && summary) {
+            this.addProblem('runtime', summary, buildRuntimeFixPrompt(probe.report))
+            this.push('error', `runtime: ${summary}`)
+            if (this.maybeAutoFix()) return
+            this.push('status', '/fix sends open problems to the engine · /problems lists them')
+          } else if (probe) {
+            this.clearProblems('runtime')
+            this.perfPulse(probe.perf)
+            const pct = await this.visualPulse(probe.pulsePath)
+            // Substantial visual change + autoReview → the engine looks at
+            // its own work, once per ask.
+            if (this.opts.autoReview && pct !== null && pct >= 10 && !this.autoReviewedThisAsk) {
+              this.autoReviewedThisAsk = true
+              this.push('status', `auto-review: the page changed ${pct.toFixed(0)}% — capturing for self-critique`)
+              this.notify({ running: false })
+              const captureResult = await this.capture()
+              if (captureResult) {
+                await this.runTurn(this.reviewPrompt(captureResult), '👁 auto-review rendered UI')
+              }
+              return
+            }
+          }
+        }
+        if (!this.reviewTipShown && this.state.devUrl) {
+          this.reviewTipShown = true
+          this.push('status', 'tip: /review screenshots the app and has the engine critique its own work')
+        }
+      }
+    }
+    this.notify({ running: false })
+    await this.maybeLaneReview(display)
+    this.drainQueue()
+  }
+
+  /**
+   * The review lane: a second read-only pass in fresh context after
+   * each real ask — the diff, not the conversation, so it can't inherit
+   * the implementer's blind spots. Findings render as critique; nothing
+   * here edits. Costs a cheap turn (fixModel when set); off by default.
+   */
+  private async maybeLaneReview(display: string): Promise<void> {
+    if (!this.laneEnabled || this.inLane) return
+    if (display.startsWith('⛑') || display.startsWith('👁') || display.startsWith('🔎') || display.startsWith('/distill')) return
+    const checkpoint = this.checkpoints.at(-1)
+    if (!checkpoint) return
+    let diff: string
+    try {
+      const { execFileSync } = await import('node:child_process')
+      diff = execFileSync('git', ['diff', checkpoint.snapshot.stashHash ?? 'HEAD'], {
+        cwd: this.execCwd(),
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch {
+      return
+    }
+    if (diff.trim().length === 0) return
+    const capped = diff.length > 20000 ? `${diff.slice(0, 20000)}\n[diff truncated]` : diff
+    this.inLane = true
+    try {
+      await this.runTurn(
+        `You are a second reviewer in fresh context. The diff below just landed for the ask "${display}". Review ONLY the diff — do not edit anything, do not run commands that modify state. Report at most 3 concrete findings ranked by severity (bugs, regressions, accessibility, design-system violations), each with file and line. If it is clean, say so in one line.\n\n\`\`\`diff\n${capped}\n\`\`\``,
+        '🔎 lane review',
+        this.opts.fixModel,
+        { fresh: true },
+      )
+    } finally {
+      this.inLane = false
+    }
+  }
+
+  async submit(ask: string): Promise<void> {
+    this.fixAttempts = 0
+    this.autoReviewedThisAsk = false
+    // Checkpoint per ask: the snapshot covers this turn plus its fixes.
+    // In sandbox mode the worktree IS the safety net; discard is the undo.
+    const snapshot = this.state.sandbox ? null : takeSnapshot(this.opts.cwd)
+    if (snapshot) {
+      this.checkpoints.push({
+        snapshot,
+        label: ask.length > 60 ? `${ask.slice(0, 59)}…` : ask,
+        at: Date.now(),
+      })
+      if (this.checkpoints.length > 20) this.checkpoints.shift()
+    }
+    // The brief itself is placed by runTurn per engine capability; the
+    // foundation-first addendum rides only on the session's opening ask.
+    const firstAsk = this.asksSent === 0
+    this.asksSent += 1
+    let prompt = ask
+    // Repo rules + keyword-triggered skills ride along on every ask.
+    const enrichment = enrich(this.opts.cwd, ask, { bundled: this.opts.bundledSkills })
+    if (enrichment.matchedSkills.length > 0) {
+      this.push('status', `skills: ${enrichment.matchedSkills.join(', ')}`)
+    }
+    prompt += enrichment.sections
+    if (this.goal) {
+      prompt += `\n\n## Standing goal (machine-checked)\n\n${this.goal}\n\nsquint verifies every turn — gates, runtime probe, page audits. Do not declare this done while any of its checks fail; squint will keep sending failures back until they are clean.`
+    }
+    await this.runTurn(prompt, ask, undefined, { firstAsk })
+  }
+
+  /** Restore files to the state before checkpoint `index`; drop it and everything after. */
+  private restoreTo(index: number): void {
+    const checkpoint = this.checkpoints[index]
+    if (!checkpoint) {
+      this.push('status', 'no such checkpoint — /checkpoints lists them')
+      return
+    }
+    const result = restoreSnapshot(this.opts.cwd, checkpoint.snapshot)
+    if (result.restored) {
+      const dropped = this.checkpoints.length - index
+      appendDecision(this.opts.cwd, { decision: `rejected and rolled back: \"${checkpoint.label}\"`, source: 'restore' })
+      this.checkpoints = this.checkpoints.slice(0, index)
+      this.push(
+        'status',
+        `restored files to before "${checkpoint.label}"${
+          dropped > 1 ? ` · ${dropped} asks rolled back` : ''
+        }${result.deletedFiles > 0 ? ` · removed ${result.deletedFiles} created file(s)` : ''} — the conversation continues from here`,
+      )
+    } else {
+      this.push('error', `restore failed: ${result.detail ?? 'unknown error'}`)
+    }
+  }
+
+  /** Cross-turn load-performance deltas: the perf twin of the visual pulse. */
+  private perfPulse(perf: ProbeResult['perf']): void {
+    if (!perf || (perf.lcpMs === undefined && perf.transferBytes === undefined)) return
+    const previous = this.lastPerf
+    this.lastPerf = perf
+    const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)}MB`
+    const parts: string[] = []
+    if (perf.lcpMs !== undefined) {
+      const delta =
+        previous?.lcpMs !== undefined && Math.abs(perf.lcpMs - previous.lcpMs) >= 100
+          ? ` (${perf.lcpMs > previous.lcpMs ? '+' : '−'}${Math.abs(perf.lcpMs - previous.lcpMs)}ms)`
+          : ''
+      parts.push(`LCP ${perf.lcpMs}ms${delta}`)
+    }
+    if (perf.cls !== undefined && perf.cls > 0.05) parts.push(`CLS ${perf.cls}`)
+    if (perf.transferBytes !== undefined) {
+      const delta =
+        previous?.transferBytes !== undefined &&
+        Math.abs(perf.transferBytes - previous.transferBytes) > 100 * 1024
+          ? ` (${perf.transferBytes > previous.transferBytes ? '+' : '−'}${mb(Math.abs(perf.transferBytes - previous.transferBytes))})`
+          : ''
+      parts.push(`${mb(perf.transferBytes)}${delta}`)
+    }
+    if (perf.requests !== undefined) parts.push(`${perf.requests} req`)
+    if (parts.length > 0) this.push('status', `perf: ${parts.join(' · ')}`)
+  }
+
+  /**
+   * Cross-turn visual drift check: compare this turn's pulse screenshot
+   * with the previous one and report how much of the page changed.
+   * Informational — changes are usually intended; surprises shouldn't be.
+   */
+  private async visualPulse(pulsePath: string | undefined): Promise<number | null> {
+    if (!pulsePath) return null
+    let current: Buffer
+    try {
+      current = (await import('node:fs')).readFileSync(pulsePath)
+    } catch {
+      return null
+    }
+    const previous = this.lastPulse
+    this.lastPulse = current
+    if (!previous) {
+      this.push('status', 'visual pulse: baseline captured')
+      this.push('image', pulsePath)
+      return null
+    }
+    const { previewDir } = await import('../preview/preview.js')
+    const diff = await comparePulseAttributed(
+      previous,
+      current,
+      this.state.devUrl ?? undefined,
+      (await import('node:path')).join(previewDir(this.opts.cwd), 'triptych.png'),
+    )
+    if (diff === null) return null
+    const pct = diff.pct
+    this.push(
+      'status',
+      pct < 0.5
+        ? 'visual pulse: stable vs last turn'
+        : `visual pulse: ${pct.toFixed(1)}% of the page changed vs last turn${diff.sentences.length > 0 ? `\n${diff.sentences.map((s) => `  ${s}`).join('\n')}` : ''}`,
+    )
+    runHook(this.opts.cwd, 'on-pulse-diff', { pct: pct.toFixed(1) })
+    // Show the change when it actually changed; stable turns stay text-only.
+    if (pct >= 0.5) this.push('image', diff.triptychPath ?? pulsePath)
+    return pct
+  }
+
+  /** Screenshot the running app (and watch its runtime where CDP is available). */
+  private async capture(urlOverride?: string): Promise<CaptureResult | null> {
+    const url = urlOverride || this.state.devUrl
+    if (!url) {
+      this.push('error', 'dev server not running — /dev first, or /shot <url>')
+      return null
+    }
+    this.push('status', 'capturing screenshots…')
+    const result = await captureViewports(this.opts.cwd, url)
+    if (!result) {
+      this.push('error', 'no Chrome/Chromium found for screenshots')
+      return null
+    }
+    for (const err of result.errors) this.push('error', `screenshot ${err}`)
+    if (result.shots.length > 0) {
+      this.push(
+        'status',
+        `captured ${result.shots.map((s) => s.name).join(', ')} → ${path.dirname(result.shots[0]!.path)}`,
+      )
+      const desktop = result.shots.find((s) => s.name === 'desktop') ?? result.shots[0]!
+      this.push('image', desktop.path)
+    }
+    if (result.runtime) {
+      const summary = runtimeSummary(result.runtime)
+      if (summary) {
+        this.push('error', `runtime: ${summary}`)
+        this.addProblem('runtime', summary, buildRuntimeFixPrompt(result.runtime))
+        this.push('status', '/fix sends open problems to the engine')
+      } else {
+        this.clearProblems('runtime')
+        this.push('status', 'runtime clean — no console errors, exceptions, or failed requests')
+      }
+    }
+    const secrets = (result.security ?? []).filter((f) => f.startsWith('secret:'))
+    if (secrets.length > 0) {
+      this.push('error', `🔓 security: ${secrets.length} finding(s)\n${secrets.join('\n')}`)
+      this.addProblem(
+        'runtime',
+        `${secrets.length} secret(s) in served bytes`,
+        `The served app leaks credentials — move them server-side behind endpoints, purge them from the bundle, and tell the user to ROTATE the exposed keys (rotation cannot be automated away):\n\n${secrets.join('\n')}`,
+      )
+    }
+    const gatesOnly = (result.security ?? []).filter((f) => f.startsWith('client-side gate:'))
+    if (gatesOnly.length > 0) this.push('error', gatesOnly.join('\n'))
+    const vtHard = (result.viewTransitions ?? []).filter((f) => f.startsWith('duplicate'))
+    if (vtHard.length > 0) {
+      this.push('error', `view transitions: ${vtHard.length} broken\n${vtHard.join('\n')}`)
+      this.addProblem(
+        'runtime',
+        `${vtHard.length} view transition(s) the browser will skip`,
+        `Duplicate view-transition-name values make the browser abort the entire transition at runtime:\n\n${vtHard.join('\n')}\n\nGive each simultaneously rendered element a unique name (or scope names per item, e.g. per list key). Do not remove the transitions.`,
+      )
+    }
+    const vtSoft = (result.viewTransitions ?? []).filter((f) => !f.startsWith('duplicate'))
+    if (vtSoft.length > 0) {
+      this.push('status', `view transitions: ${vtSoft.join('; ')}`)
+    }
+    if (result.phantoms && result.phantoms.length > 0) {
+      this.push('error', `phantom classes: ${result.phantoms.length} (in the DOM, absent from CSS)\n${result.phantoms.slice(0, 5).join('\n')}`)
+      this.addProblem(
+        'runtime',
+        `${result.phantoms.length} phantom class(es) — elements silently unstyled`,
+        `These class tokens appear in the DOM but match no CSS rule, so the elements are silently unstyled. Usually a misspelled or version-mismatched utility (e.g. Tailwind v3 spellings in a v4 project) or a concatenated class the scanner never compiled:\n\n${result.phantoms.join('\n')}\n\nFix the class names or define the styles, then confirm visually.`,
+      )
+      this.push('status', '/fix sends open problems to the engine')
+    }
+    if (result.slop && result.slop.length > 0) {
+      this.push('status', `distinctiveness: ${result.slop.length} tell(s)\n${result.slop.join('\n')}`)
+    }
+    if (result.a11y && result.a11y.length > 0) {
+      this.push('error', `a11y: ${result.a11y.length} finding(s)\n${result.a11y.slice(0, 5).join('\n')}`)
+      this.addProblem(
+        'a11y',
+        `${result.a11y.length} accessibility finding(s)`,
+        `Fix these accessibility defects found by an automated sweep of the running app:\n\n${result.a11y.join('\n')}\n\nThey are objective defects, not style preferences.`,
+      )
+      this.push('status', '/review folds these into the fix pass · /fix sends them directly')
+    } else if (result.runtime) {
+      this.clearProblems('a11y')
+    }
+    return result.shots.length > 0 ? result : null
+  }
+
+  command(commandLine: string): void {
+    const [name, ...rest] = commandLine.slice(1).split(/\s+/)
+    const arg = rest.join(' ').trim()
+    switch (name) {
+      case 'engines': {
+        void import('../engines/registry.js').then(({ detectEngines }) => {
+          const lines = detectEngines().map(({ engine, path: binaryPath }) => {
+            const mark = binaryPath ? '✓' : '✗'
+            const traits = [engine.createParser ? 'stream' : 'text', engine.supportsResume ? 'resume' : null]
+              .filter(Boolean)
+              .join(' · ')
+            return `${mark} ${engine.id} — ${traits}${binaryPath ? '' : ` · install: ${engine.install}`}`
+          })
+          this.push('status', `${lines.join('\n')}\n/engine <id> switches (new session)`)
+        })
+        break
+      }
+      case 'engine':
+        if (!arg) {
+          this.command('/engines')
+        } else {
+          try {
+            getEngine(arg)
+            this.sessionId = undefined
+            this.asksSent = 0
+            this.notify({ engineId: arg })
+            this.push('status', `engine → ${arg} (new session)`)
+          } catch (err) {
+            this.push('error', err instanceof Error ? err.message : String(err))
+          }
+        }
+        break
+      case 'model':
+        this.notify({ model: arg || undefined })
+        this.push('status', arg ? `model → ${arg}` : 'model → engine default')
+        break
+      case 'mode':
+        if (arg === 'plan' || arg === 'safe' || arg === 'yolo') {
+          this.setMode(arg)
+        } else {
+          this.push('status', 'usage: /mode plan|safe|yolo — or shift+tab to cycle')
+        }
+        break
+      case 'dev': {
+        const dev = this.devServer()
+        if (arg === 'logs') {
+          const tail = dev.tail(15)
+          this.push('status', tail.length > 0 ? tail.join('\n') : 'no dev server output captured yet')
+          break
+        }
+        if (arg === 'restart') {
+          if (dev.state !== 'stopped') dev.stop()
+          this.notify({ devUrl: null })
+          const devCommand = detectDevCommand(this.opts.cwd)
+          if (!devCommand) {
+            this.push('error', 'no dev/start script found in package.json')
+          } else {
+            dev.start(devCommand)
+            this.push('status', `dev server restarting · ${devCommand.display}`)
+          }
+          break
+        }
+        if (dev.state === 'stopped' || dev.state === 'crashed') {
+          const devCommand = detectDevCommand(this.opts.cwd)
+          if (!devCommand) {
+            this.push('error', 'no dev/start script found in package.json')
+          } else {
+            dev.start(devCommand)
+            this.push('status', `dev server starting · ${devCommand.display}`)
+          }
+        } else {
+          dev.stop()
+          this.notify({ devUrl: null })
+          this.push('status', 'dev server stopped')
+        }
+        break
+      }
+      case 'fix': {
+        if (this.state.problems.length === 0) {
+          this.push('status', 'nothing to fix — no open problems')
+          break
+        }
+        const index = Number.parseInt(arg, 10)
+        if (arg && Number.isInteger(index)) {
+          const target = this.state.problems[index - 1]
+          if (!target) {
+            this.push('status', `usage: /fix [1–${this.state.problems.length}] — see /problems`)
+            break
+          }
+          this.dispatchFix([target])
+        } else if (arg) {
+          // /fix <source> narrows to one stream: /fix a11y, /fix check, …
+          const bySource = this.state.problems.filter((p) => p.source === arg)
+          if (bySource.length === 0) {
+            const sources = [...new Set(this.state.problems.map((p) => p.source))].join(', ')
+            this.push('status', `no open ${arg} problems — open sources: ${sources}`)
+            break
+          }
+          this.dispatchFix(bySource)
+        } else {
+          this.dispatchFix([...this.state.problems])
+        }
+        break
+      }
+      case 'lane': {
+        if (arg === 'on') {
+          this.laneEnabled = true
+          this.push('status', 'review lane on — every ask gets a second read-only pass over its diff (fixModel when set)')
+        } else if (arg === 'off') {
+          this.laneEnabled = false
+          this.push('status', 'review lane off')
+        } else {
+          this.push('status', `review lane is ${this.laneEnabled ? 'on' : 'off'} — /lane on|off`)
+        }
+        break
+      }
+      case 'distill': {
+        void (async () => {
+          const { loadDecisions } = await import('./designLog.js')
+          const decisions = loadDecisions(this.opts.cwd, 24)
+          if (decisions.length < 3) {
+            this.push('status', `only ${decisions.length} decision(s) on record — distillation needs a few more (/decide, variants, approvals, rollbacks all feed the ledger)`)
+            return
+          }
+          const ledger = decisions
+            .map((d) => `- [${d.source}] ${d.decision}`)
+            .join('\n')
+          const prompt = `The design ledger below is every decision this project has recorded — approvals, rejections, chosen variants, rollbacks. Distill the accumulated taste into standing enforcement:
+
+${ledger}
+
+1. Append at most 3 SHORT always-on rules to .squint/rules.md capturing patterns that repeat across decisions (rejections matter most — "no gradient buttons" beats restating one-off choices). Create the file if missing; never delete existing rules.
+2. Where a decision is mechanically checkable in the DOM, write a persistent check at .squint/checks/<name>.js — plain JS that evaluates IN THE PAGE to an array of failure strings (empty = pass). At most 2 new checks; skip anything that needs judgment rather than a selector.
+3. Reply with exactly what you wrote and why, briefly.
+
+Do not restyle anything — this task only writes rules and checks.`
+          await this.runTurn(prompt, '/distill — compress the ledger into rules and checks', this.opts.fixModel)
+        })()
+        break
+      }
+      case 'goal': {
+        if (!arg || arg === 'show') {
+          this.push('status', this.goal ? `standing goal: ${this.goal}` : 'no standing goal — /goal <objective> arms one; /goal off clears')
+          break
+        }
+        if (arg === 'off') {
+          this.goal = null
+          this.push('status', 'goal cleared — auto-fix back to the normal cap')
+          break
+        }
+        this.goal = arg
+        this.push('status', `goal armed: ${arg}\nevery ask now carries it; auto-fix presses to ${MAX_GOAL_FIX_ATTEMPTS} attempts until squint's checks come back clean`)
+        break
+      }
+      case 'context': {
+        import('../quality/contextDoctor.js')
+          .then(({ contextReport, formatContextReport }) => {
+            this.push('status', formatContextReport(contextReport(this.execCwd(), { bundled: this.opts.bundledSkills })))
+          })
+          .catch((error: unknown) => {
+            this.push('status', `context report failed: ${error instanceof Error ? error.message : String(error)}`)
+          })
+        break
+      }
+      case 'yes':
+      case 'no': {
+        if (!this.state.pendingApproval) {
+          this.push('status', `nothing awaiting approval — /${name} answers an engine's approval request`)
+          break
+        }
+        const summary = this.state.pendingApproval
+        this.notify({ pendingApproval: null })
+        const approved = name === 'yes'
+        appendDecision(this.opts.cwd, {
+          decision: `${approved ? 'approved' : 'rejected'}: ${summary}${arg ? ` — ${arg}` : ''}`,
+          source: 'approval',
+        })
+        void this.runTurn(
+          approved
+            ? `Approved: "${summary}". Proceed.${arg ? ` Note from the user: ${arg}` : ''}`
+            : `Rejected: "${summary}". Do not proceed with it.${arg ? ` The user says: ${arg}` : ' Stop and await direction.'}`,
+          approved ? `✓ approved${arg ? ` — ${arg}` : ''}` : `✗ rejected${arg ? ` — ${arg}` : ''}`,
+        )
+        break
+      }
+      case 'decide': {
+        if (!arg) {
+          this.push('status', 'usage: /decide <the decision> — recorded in .squint/design-log.jsonl and injected into every future ask')
+          break
+        }
+        appendDecision(this.opts.cwd, {
+          decision: arg,
+          source: 'decide',
+          screenshot: this.lastPulse ? '.squint/preview/pulse.png' : undefined,
+        })
+        this.push('status', `decision recorded: ${arg}`)
+        break
+      }
+      case 'find': {
+        if (!arg) {
+          this.push('status', 'usage: /find <term> — searches this session and saved transcripts')
+          break
+        }
+        const needle = arg.toLowerCase()
+        const matches: string[] = []
+        for (const item of this.state.items) {
+          if ((item.role === 'user' || item.role === 'assistant') && item.text.toLowerCase().includes(needle)) {
+            const line = item.text.split('\n').find((l) => l.toLowerCase().includes(needle)) ?? item.text
+            matches.push(`[live] ${item.role === 'user' ? '❯ ' : ''}${line.trim().slice(0, 90)}`)
+            if (matches.length >= 8) break
+          }
+        }
+        if (matches.length < 8) {
+          void (async () => {
+            try {
+              const fs = await import('node:fs')
+              const path = await import('node:path')
+              const dir = path.join(this.opts.cwd, '.squint', 'transcripts')
+              const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort().reverse().slice(0, 20)
+              for (const file of files) {
+                if (matches.length >= 8) break
+                const text = fs.readFileSync(path.join(dir, file), 'utf8')
+                for (const line of text.split('\n')) {
+                  if (line.toLowerCase().includes(needle)) {
+                    matches.push(`[${file.replace(/\.md$/, '')}] ${line.trim().slice(0, 90)}`)
+                    break // one hit per transcript keeps results scannable
+                  }
+                }
+              }
+            } catch {
+              // no saved transcripts
+            }
+            this.push(
+              'status',
+              matches.length > 0
+                ? `${matches.join('\n')}\n/checkpoints can rewind · /save archives this session`
+                : `no matches for "${arg}"`,
+            )
+          })()
+        } else {
+          this.push('status', matches.join('\n'))
+        }
+        break
+      }
+      case 'save': {
+        void (async () => {
+          const fs = await import('node:fs')
+          const path = await import('node:path')
+          const dir = path.join(this.opts.cwd, '.squint', 'transcripts')
+          fs.mkdirSync(dir, { recursive: true })
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+          const file = path.join(dir, `${stamp}.md`)
+          const lines: string[] = [`# squint session — ${new Date().toISOString().slice(0, 16)}`, '']
+          for (const item of this.state.items) {
+            switch (item.role) {
+              case 'user':
+                lines.push(`## ❯ ${item.text}`, '')
+                break
+              case 'assistant':
+                lines.push(item.text, '')
+                break
+              case 'tool':
+                lines.push(`- ⚙ ${item.text}`)
+                break
+              case 'image':
+                lines.push(`![screenshot](${item.text})`, '')
+                break
+              case 'thinking':
+                break
+              default:
+                lines.push(`> ${item.role === 'error' ? '✗ ' : ''}${item.text.split('\n').join('\n> ')}`)
+            }
+          }
+          lines.push('', `> ${this.summary()}`)
+          // Evidence pointers: the ledger and receipts that back this session.
+          try {
+            const { loadDecisions } = await import('./designLog.js')
+            const decisions = loadDecisions(this.opts.cwd, 8)
+            if (decisions.length > 0) {
+              lines.push('', '## Design decisions on record', '')
+              for (const d of decisions) lines.push(`- ${d.decision} _(${d.source})_`)
+            }
+            const receiptsDir = path.join(this.opts.cwd, '.squint', 'receipts')
+            const receipts = fs.existsSync(receiptsDir) ? fs.readdirSync(receiptsDir).filter((f) => f.endsWith('.json')) : []
+            if (receipts.length > 0) {
+              lines.push('', `> verification receipts: ${receipts.length} in .squint/receipts/ (latest: ${receipts.sort().at(-1)})`)
+            }
+          } catch {
+            // evidence pointers never block the export
+          }
+          fs.writeFileSync(file, lines.join('\n') + '\n')
+          this.push('status', `saved transcript → ${path.relative(this.opts.cwd, file)}`)
+        })()
+        break
+      }
+      case 'flows': {
+        if (!this.state.devUrl) {
+          this.push('error', 'dev server not running — /dev first')
+          break
+        }
+        if (arg.trim() === 'suggest') {
+          void (async () => {
+            const chrome = findChrome()
+            if (!chrome) {
+              this.push('error', 'no Chrome/Chromium found')
+              return
+            }
+            const { suggestFlows } = await import('../preview/flows.js')
+            this.push('status', 'drafting flows from the live routes…')
+            const { created, skipped } = await suggestFlows(this.opts.cwd, this.state.devUrl!, chrome)
+            if (created.length > 0) this.push('status', `drafted ${created.length} flow(s): ${created.join(', ')} — edit .squint/flows/*.flow or ask the engine to deepen them`)
+            if (skipped.length > 0) this.push('status', `kept existing: ${skipped.join(', ')}`)
+            if (created.length === 0 && skipped.length === 0) this.push('status', 'no routes to draft from — add .squint/routes')
+          })()
+          break
+        }
+        void (async () => {
+          const { loadFlows } = await import('../preview/flows.js')
+          const flows = loadFlows(this.opts.cwd)
+          if (flows.length === 0) {
+            this.push('status', 'no flows — add .squint/flows/<name>.flow (goto/click/fill/press/expect/shot lines), or ask the engine to write one')
+            return
+          }
+          const chrome = findChrome()
+          if (!chrome) {
+            this.push('error', 'no Chrome/Chromium found for flows')
+            return
+          }
+          const { runFlow } = await import('../preview/cdp.js')
+          const { previewDir } = await import('../preview/preview.js')
+          this.push('status', `replaying ${flows.length} flow(s)…`)
+          this.notify({ running: true, runStartedAt: Date.now() })
+          const failures: string[] = []
+          for (const flow of flows) {
+            const wanted = arg.trim()
+            if (wanted && flow.name !== wanted) continue
+            const result = await runFlow(chrome, this.state.devUrl!, flow, previewDir(this.opts.cwd))
+            if (result.ok) {
+              this.push('status', `✓ flow ${flow.name} · ${flow.steps.length} steps · ${(result.durationMs / 1000).toFixed(1)}s${result.shots.length > 0 ? ` · ${result.shots.length} shot(s)` : ''}`)
+              if (result.transitions.length > 0) this.push('status', result.transitions.map((t) => `  ${t}`).join('\n'))
+              if (result.leaks.length > 0) this.push('error', result.leaks.join('\n'))
+              if (result.shifts.length > 0) this.push('status', result.shifts.join('\n'))
+              for (const shot of result.shots) this.push('image', shot)
+            } else {
+              const where = result.failedStep ? ` at step ${result.failedStep}` : ''
+              this.push('error', `✗ flow ${flow.name}${where}: ${result.detail}`)
+              failures.push(`Flow "${flow.name}" fails${where}: ${result.detail}. The flow file is .squint/flows/${flow.name}.flow — fix the app (or the flow if the UI legitimately changed).`)
+            }
+          }
+          this.notify({ running: false })
+          if (failures.length > 0) {
+            this.addProblem('flow', `${failures.length} flow(s) failing`, failures.join('\n\n'))
+            this.push('status', '/fix sends open problems to the engine · /problems lists them')
+          } else {
+            this.clearProblems('flow')
+          }
+          this.drainQueue()
+        })()
+        break
+      }
+      case 'score': {
+        if (!this.state.devUrl) {
+          this.push('error', 'dev server not running — /dev first')
+          break
+        }
+        void (async () => {
+          const result = await this.capture()
+          if (!result) return
+          const a11yCount = result.a11y?.length ?? 0
+          const slopCount = result.slop?.length ?? 0
+          const runtimeBad = result.runtime ? (runtimeSummary(result.runtime) ? 1 : 0) : 0
+          const hardCount =
+            (result.phantoms?.length ?? 0) +
+            (result.viewTransitions?.filter((v) => v.startsWith('duplicate')).length ?? 0) +
+            (result.checkFailures?.length ?? 0)
+          const softCount = (result.jank?.length ?? 0) + (result.locale?.length ?? 0) + (result.speculation?.length ?? 0)
+          const problems = this.state.problems.length
+          // Deterministic axes only: 5.0 minus measured debt, floored at 0.
+          // Judgment (hierarchy, taste) stays /review's job — LLM judges
+          // are unreliable on absolute quality, per the eval research.
+          const score = Math.max(
+            0,
+            5 -
+              problems * 0.75 -
+              Math.min(a11yCount, 4) * 0.25 -
+              Math.min(slopCount, 4) * 0.25 -
+              runtimeBad -
+              Math.min(hardCount, 3) * 0.5 -
+              Math.min(softCount, 4) * 0.125,
+          )
+          const lcp = this.lastPerf?.lcpMs !== undefined ? ` · LCP ${this.lastPerf.lcpMs}ms` : ''
+          this.push(
+            'status',
+            [
+              `score: ${score.toFixed(2)}/5 (deterministic axes)`,
+              `  open problems: ${problems}${problems > 0 ? ` (${this.state.problems.map((p) => p.source).join(', ')})` : ''}`,
+              `  a11y findings: ${a11yCount} · distinctiveness tells: ${slopCount} · runtime ${runtimeBad ? 'dirty' : 'clean'}${lcp}`,
+              `  hard findings: ${hardCount} (phantoms, broken transitions, failed checks) · advisories: ${softCount} (jank, locale, speculation)`,
+              '  /review judges what numbers cannot — hierarchy, taste, coherence',
+            ].join('\n'),
+          )
+        })()
+        break
+      }
+      case 'polish': {
+        const rounds = arg ? Number.parseInt(arg, 10) : 2
+        if (!Number.isInteger(rounds) || rounds < 1 || rounds > 5) {
+          this.push('status', 'usage: /polish [1-5] — rounds of screenshot → critique → fix (each costs a turn)')
+          break
+        }
+        if (!this.state.devUrl) {
+          this.push('error', 'dev server not running — /dev first')
+          break
+        }
+        this.push('status', `polishing: ${rounds} round${rounds === 1 ? '' : 's'} of review → fix`)
+        void this.polish(rounds)
+        break
+      }
+      case 'btw':
+        if (!arg) {
+          this.push('status', 'usage: /btw <question> — read-only side question, main thread untouched')
+        } else {
+          void this.btw(arg)
+        }
+        break
+      case 'copy': {
+        const last = this.state.items.findLast((i) => i.role === 'assistant')
+        if (!last) {
+          this.push('status', 'nothing to copy yet')
+          break
+        }
+        void import('node:child_process').then(({ spawn }) => {
+          const cmd =
+            process.platform === 'darwin'
+              ? spawn('pbcopy')
+              : process.platform === 'win32'
+                ? spawn('clip')
+                : spawn('xclip', ['-selection', 'clipboard'])
+          cmd.on('error', () => this.push('error', 'no clipboard tool found'))
+          cmd.on('close', (code) => {
+            if (code === 0) this.push('status', `copied last reply (${last.text.length} chars)`)
+          })
+          cmd.stdin?.end(last.text)
+        })
+        break
+      }
+      case 'problems':
+        if (this.state.problems.length === 0) {
+          this.push('status', 'no open problems')
+        } else {
+          const glyphs: Record<string, string> = {
+            gates: '⛩', dev: '🖥', runtime: '⚡', a11y: '♿', flow: '🧭', check: '☑',
+          }
+          const bySource = new Map<string, number>()
+          for (const p of this.state.problems) bySource.set(p.source, (bySource.get(p.source) ?? 0) + 1)
+          const lines = this.state.problems.map(
+            (p, i) => `${i + 1}. ${glyphs[p.source] ?? '·'} [${p.source}] ${p.summary.split('\n')[0]}`,
+          )
+          const tally = [...bySource.entries()].map(([src, n]) => `${src} ${n}`).join(' · ')
+          this.push('status', `${lines.join('\n')}\n${tally}\n/fix sends all · /fix <n> one · /fix <source> a stream`)
+        }
+        break
+      case 'check':
+        void (async () => {
+          const gates = detectGates(this.opts.cwd)
+          if (gates.length === 0) {
+            this.push('status', 'no gates detected in this project')
+            return
+          }
+          this.push('status', `running gates: ${gates.map((g) => g.id).join(' → ')}`)
+          this.notify({ running: true, runStartedAt: Date.now() })
+          const results = await runGates(this.opts.cwd, gates, (result) => {
+            this.push(
+              result.ok ? 'status' : 'error',
+              `${result.ok ? '✓' : '✗'} ${result.gate.id} · ${(result.durationMs / 1000).toFixed(1)}s`,
+            )
+          })
+          this.notify({ running: false })
+          this.drainQueue()
+          const failures = results.filter((r) => !r.ok)
+          if (failures.length > 0) {
+            this.addProblem('gates', failures.map((f) => f.gate.id).join(' + '), buildGatePrompt(failures))
+            this.push('status', '/fix sends open problems to the engine · /problems lists them')
+          } else {
+            this.clearProblems('gates')
+            this.push('status', 'all gates passed')
+          }
+        })()
+        break
+      case 'shot':
+        void this.capture(arg || undefined)
+        break
+      case 'review':
+        void (async () => {
+          const result = await this.capture()
+          if (result) {
+            await this.runTurn(this.reviewPrompt(result, arg || undefined), `👁 review rendered UI${arg ? ` · ${arg}` : ''}`)
+          }
+        })()
+        break
+      case 'undo':
+        if (this.checkpoints.length === 0) {
+          this.push('status', 'nothing to undo — no ask this session, or not a git repo with commits')
+        } else {
+          this.restoreTo(this.checkpoints.length - 1)
+        }
+        break
+      case 'checkpoints':
+        if (this.checkpoints.length === 0) {
+          this.push('status', 'no checkpoints yet — one is taken before every ask in a git repo')
+        } else {
+          const lines = this.checkpoints.map((c, i) => {
+            const mins = Math.max(0, Math.round((Date.now() - c.at) / 60000))
+            return `${i + 1}. ${c.label} · ${mins}m ago`
+          })
+          this.push('status', `${lines.join('\n')}\n/restore <n> rewinds files to before that ask · /undo pops the last`)
+        }
+        break
+      case 'restore': {
+        const index = Number.parseInt(arg, 10)
+        if (!Number.isInteger(index) || index < 1 || index > this.checkpoints.length) {
+          this.push('status', `usage: /restore <1–${Math.max(this.checkpoints.length, 1)}> — see /checkpoints`)
+        } else {
+          this.restoreTo(index - 1)
+        }
+        break
+      }
+      case 'resume': {
+        const saved = loadState(this.opts.cwd)
+        if (!saved) {
+          this.push('status', 'no previous session for this project')
+          break
+        }
+        try {
+          if (!getEngine(saved.engine).supportsResume) {
+            this.push('status', `previous engine ${saved.engine} cannot resume sessions`)
+            break
+          }
+        } catch {
+          this.push('error', `previous engine ${saved.engine} is no longer available`)
+          break
+        }
+        this.sessionId = saved.sessionId
+        // The resumed session already had its opening ask; no foundation-first addendum.
+        this.asksSent = saved.totals?.turns ?? 1
+        this.notify({
+          engineId: saved.engine,
+          model: saved.model ?? this.state.model,
+          totals: saved.totals ?? this.state.totals,
+        })
+        this.push('status', `resumed ${saved.engine} session${saved.lastAsk ? ` · "${saved.lastAsk}"` : ''}`)
+        break
+      }
+      case 'sandbox': {
+        if (this.state.running) {
+          this.push('status', 'wait for the current turn before changing sandbox state')
+          break
+        }
+        if (arg === 'diff') {
+          const stat = sandboxDiffStat(this.opts.cwd)
+          if (!stat) {
+            this.push('status', sandboxExists(this.opts.cwd) ? 'sandbox is clean' : 'no sandbox open — /sandbox on')
+          } else {
+            this.push('status', `${stat}\n${sandboxFiles(this.opts.cwd).join('\n')}`)
+          }
+          break
+        }
+        if (arg === 'apply') {
+          const applied = applySandbox(this.opts.cwd)
+          if (applied.ok) {
+            discardSandbox(this.opts.cwd)
+            this.notify({ sandbox: false })
+            this.resetDevServer()
+            appendDecision(this.opts.cwd, { decision: 'accepted the sandboxed session onto the real tree', source: 'sandbox' })
+            this.push('status', 'sandbox applied to the real tree — review with git diff')
+          } else {
+            this.push('error', applied.detail ?? 'apply failed')
+          }
+          break
+        }
+        if (arg === 'discard' || arg === 'off') {
+          const had = discardSandbox(this.opts.cwd)
+          this.notify({ sandbox: false })
+          this.resetDevServer()
+          this.push('status', had ? 'sandbox discarded — the real tree was never touched' : 'no sandbox open')
+          break
+        }
+        if (arg === 'on' || arg === '') {
+          if (!isGitRepo(this.opts.cwd)) {
+            this.push('error', 'sandbox needs a git repo with at least one commit')
+            break
+          }
+          const { reused } = openSandbox(this.opts.cwd)
+          this.notify({ sandbox: true })
+          this.resetDevServer()
+          this.push(
+            'status',
+            `${reused ? 'rejoined the open sandbox' : 'sandbox opened'} — asks now accumulate in a shadow worktree; /sandbox diff · apply · discard`,
+          )
+          break
+        }
+        this.push('status', 'usage: /sandbox [on] · diff · apply · discard')
+        break
+      }
+      case 'variants': {
+        const [sub, ...subRest] = arg.split(/\s+/)
+        if (sub === 'apply') {
+          const id = subRest[0]
+          if (!id) {
+            this.push('status', 'usage: /variants apply <id>')
+            break
+          }
+          const applied = applyVariant(this.opts.cwd, id)
+          if (applied.ok) {
+            cleanVariants(this.opts.cwd)
+            appendDecision(this.opts.cwd, { decision: `chose the ${id} direction over the other variants`, source: 'variant' })
+            this.push('status', `applied ${id} to the working tree — review with git diff`)
+          } else {
+            this.push('error', applied.detail ?? 'apply failed')
+          }
+          break
+        }
+        if (sub === 'clean') {
+          this.push('status', `removed ${cleanVariants(this.opts.cwd)} variant(s)`)
+          break
+        }
+        if (sub === 'list') {
+          const ids = listVariants(this.opts.cwd)
+          this.push('status', ids.length > 0 ? ids.join(' · ') : 'no variants — /variants <2-4> <ask>')
+          break
+        }
+        const n = Number.parseInt(sub ?? '', 10)
+        const ask = subRest.join(' ').trim()
+        if (!Number.isInteger(n) || n < 2 || n > 4 || ask.length === 0) {
+          this.push('status', 'usage: /variants <2-4> <ask> · /variants apply <id> · list · clean')
+          break
+        }
+        if (!isGitRepo(this.opts.cwd)) {
+          this.push('error', 'variants need a git repo with at least one commit')
+          break
+        }
+        void (async () => {
+          cleanVariants(this.opts.cwd)
+          this.push('status', `generating ${n} directions in parallel — this runs ${n} engine sessions`)
+          this.notify({ running: true, runStartedAt: Date.now() })
+          const engine = getEngine(this.state.engineId)
+          const runs = await runVariants(this.opts.cwd, ask, n, engine, this.state.model, (familyId, text) =>
+            this.push('status', `[${familyId}] ${text}`),
+          )
+          const succeeded = runs.filter((r) => r.result.ok)
+          if (succeeded.length > 0 && findChrome() && detectDevCommand(this.opts.cwd)) {
+            this.push('status', 'capturing one screenshot per variant…')
+            const shots = await screenshotVariants(this.opts.cwd, succeeded.map((r) => r.variant))
+            for (const shot of shots) {
+              this.push(
+                shot.path ? 'status' : 'error',
+                `[${shot.familyId}] ${shot.path ?? shot.error ?? 'screenshot failed'}`,
+              )
+            }
+          }
+          this.notify({ running: false })
+          this.push(
+            succeeded.length > 0 ? 'status' : 'error',
+            `${succeeded.length}/${runs.length} variants ready — /variants apply <id> keeps one, /variants clean discards`,
+          )
+          this.drainQueue()
+        })()
+        break
+      }
+      case 'clear':
+        this.sessionId = undefined
+        this.asksSent = 0
+        clearState(this.opts.cwd)
+        this.notify({ items: [], totals: { costUsd: 0, turns: 0 } })
+        break
+      case 'help': {
+        void import('./commands.js').then(({ commandHelp }) => this.push('status', commandHelp()))
+        break
+      }
+      case 'quit':
+      case 'exit':
+        this.push('status', this.summary())
+        this.dispose()
+        this.opts.onQuit?.()
+        break
+      default:
+        this.push('error', `unknown command /${name} — try /help`)
+    }
+  }
+}

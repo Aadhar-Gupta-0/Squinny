@@ -1,0 +1,64 @@
+{
+  "name": "@aayambansal/squint",
+  "version": "1.0.2",
+  "description": "Lovable for your terminal \u2014 a frontend harness on top of Claude Code, Codex, and other coding agents.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Aayam Bansal",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aayambansal/squint.git"
+  },
+  "homepage": "https://github.com/aayambansal/squint#readme",
+  "bugs": {
+    "url": "https://github.com/aayambansal/squint/issues"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "frontend",
+    "harness",
+    "tui",
+    "cli",
+    "claude-code",
+    "codex",
+    "lovable",
+    "vite",
+    "design"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "squint": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "ink": "^8.0.0",
+    "ink-picture": "^2.1.0",
+    "picocolors": "^1.1.1",
+    "react": "^19.1.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.1.0",
+    "tsup": "^8.4.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}
