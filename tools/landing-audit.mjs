@@ -18,7 +18,17 @@ export function inspectHtml(html) {
     issues.push({level:'warning',rule:'html-lang',message:'Document should declare its language'});
   if (!/<meta\b[^>]*name=["']viewport["']/i.test(html))
     issues.push({level:'warning',rule:'viewport',message:'Missing mobile viewport meta tag'});
-  return {images:images.length,links:links.length,issues};
+  // Duplicate element IDs can confuse labels, anchor navigation, and screen readers.
+  const ids=[...html.matchAll(/\bid\s*=\s*["']([^"']+)["']/gi)].map(match=>match[1]);
+  const visited=new Set();
+  for(const id of ids) {
+    if(visited.has(id)) issues.push({level:'warning',rule:'duplicate-id',message:'Repeated element ID: '+id});
+    visited.add(id);
+  }
+  const h1Count=[...html.matchAll(/<h1\b/gi)].length;
+  if(h1Count===0) issues.push({level:'warning',rule:'missing-h1',message:'Document has no primary h1 heading'});
+  if(h1Count>1) issues.push({level:'warning',rule:'multiple-h1',message:'Document has multiple h1 headings'});
+  return {images:images.length,links:links.length,ids:ids.length,issues};
 }
 if (process.argv[1] && import.meta.url===new URL('file://'+process.argv[1]).href) {
   const file=process.argv[2]||'landing/index.html';
